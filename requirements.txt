@@ -1,0 +1,8 @@
+PyQt6
+pyqtgraph
+numpy
+scipy
+pyserial
+torch
+torchvision
+torchaudio
