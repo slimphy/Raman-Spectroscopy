@@ -379,14 +379,21 @@ class MappingWorker(QThread):
                         if not self.is_running: break
 
                         if stage.is_connected:
-                            stage.move_to_logical(x_val, y_val, z_val)
-                            time.sleep(0.001)
+                            # 🚨 wait_ack=False로 고속 전송
+                            stage.move_to_logical(x_val, y_val, z_val, wait_ack=False)
+                            # 🚨 이동 직후 10ms 대기 (측정/안정화)
+                            time.sleep(0.005)
 
                         cur_x, cur_y, cur_z = x_val, y_val, z_val
 
                         frame = None
                         if cam.is_connected:
-                            max_retries = 200
+                            # 🚨 [수정됨] 고정된 200회가 아닌, 노출 시간(exposure_time)에 맞춰 유동적으로 기다립니다.
+                            # 카메라 응답 지연을 대비해 설정된 노출시간 + 2초 분량만큼 넉넉히 대기합니다.
+                            # 루프 1회당 약 0.015~0.02초가 소요됨을 감안하여 최대 반복 횟수를 계산합니다.
+                            timeout_limit = self.exposure_time + 2.0
+                            max_retries = int(timeout_limit / 0.015)
+
                             for _ in range(max_retries):
                                 temp_frame = cam.grab_frame()
                                 if temp_frame is not None and hasattr(temp_frame, 'ndim'):
@@ -470,12 +477,20 @@ class MappingWorker(QThread):
 
                     self.row_finished_signal.emit(yi)
 
+
         finally:
+
             if f_csv is not None:
                 f_csv.close()
 
-        if stage.is_connected and self.is_running:
-            stage.move_to_logical(0, 0, 0)
+            # 🚨 맵핑이 정상 종료된 경우 (사용자 정지가 아닐 때) 영점 복귀
+
+            if stage.is_connected and self.is_running:
+                print("[Mapping] 스캔 완료. 0점으로 복귀합니다.")
+
+                stage.move_to_logical(0.0, 0.0, 0.0, wait_ack=True)
+
+                time.sleep(0.5)
 
         self.finished_signal.emit()
 
@@ -533,7 +548,7 @@ class HomoepiWorker(QThread):
 
                     if stage.is_connected:
                         start_z = self.z_vals[0] if z_forward else self.z_vals[-1]
-                        stage.move_to_logical(x, y, start_z)
+                        stage.move_to_logical(x, y, start_z, wait_ack=True)
 
                     current_z_vals = self.z_vals if z_forward else self.z_vals[::-1]
 
@@ -541,7 +556,9 @@ class HomoepiWorker(QThread):
                         if not self.is_running: break
 
                         if stage.is_connected:
-                            stage.move_to_logical(x, y, z)
+                            stage.move_to_logical(x, y, z, wait_ack=False)
+                            # 🚨 이동 직후 10ms 대기
+                            time.sleep(0.01)
 
                         if cam.is_connected:
                             frame = cam.grab_frame()
@@ -617,9 +634,18 @@ class HomoepiWorker(QThread):
             err_msg = traceback.format_exc()
             self.error.emit(f"스캔 중 오류 발생:\n{str(e)}\n\n{err_msg}")
 
+
         finally:
-            # 🚨 [핵심 해결] try-except 구문을 빠져나갈 때 '무조건' 이 구문이 실행됩니다.
-            # 스레드가 죽기 직전에 UI에 종료 신호를 확실하게 던집니다.
+
+            # 🚨 맵핑이 정상 종료된 경우 영점 복귀
+
+            if stage.is_connected and self.is_running:
+                print("[Homoepi] 3D 스캔 완료. 0점으로 복귀합니다.")
+
+                stage.move_to_logical(0.0, 0.0, 0.0, wait_ack=True)
+
+                time.sleep(0.5)
+
             self.finished.emit()
 
     def stop(self):
@@ -1404,6 +1430,8 @@ class MappingViewWidget(QWidget):
 
             self.btn_start_mapping.setText("⏹ 스캔 중단")
             self.btn_start_mapping.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
+            if self.main_window.control_panel.chk_auto_update.isChecked():
+                self.main_window.control_panel.update_timer.stop()
         else:
             self.stop_simulation()
 
@@ -1457,6 +1485,9 @@ class MappingViewWidget(QWidget):
         # 🚨 스캔 종료 후 라이브 모니터링 중이었다면 타이머를 다시 켬
         if getattr(self.main_window, 'is_measuring', False):
             self.main_window.live_view.timer.start(50)
+
+        if self.main_window.control_panel.chk_auto_update.isChecked():
+            self.main_window.control_panel.update_timer.start(100)
 
     def save_data(self):
         target_key = self.combo_display_target.currentText()
@@ -1688,16 +1719,25 @@ class HomoepiViewWidget(QWidget):
 
         self.worker.start()
 
+        if self.main_window.control_panel.chk_auto_update.isChecked():
+            self.main_window.control_panel.update_timer.stop()
+
     def stop_scan(self):
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.stop()
             self.btn_stop.setEnabled(False)
             self.btn_start.setText("🛑 모터 정지 및 복귀 중...")
 
+            if self.main_window.control_panel.chk_auto_update.isChecked():
+                self.main_window.control_panel.update_timer.start(100)
+
     def scan_finished(self):
         self.btn_start.setEnabled(True)
         self.btn_start.setText("▶ Homoepi 3D 스캔 시작")
         self.btn_stop.setEnabled(False)
+
+        if self.main_window.control_panel.chk_auto_update.isChecked():
+            self.main_window.control_panel.update_timer.start(100)
 
     def handle_new_data(self, x, y, thickness, raw_data):
         self.depth_profiles[(x, y)] = {"thickness": thickness, "data": raw_data}
@@ -2109,7 +2149,7 @@ class ControlPanelWidget(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(450)
 
         self.active_pairs = []
         self.pair_counter = 1
@@ -2123,31 +2163,37 @@ class ControlPanelWidget(QWidget):
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
 
+        # [1. Hardware Connection]
         conn_group = QGroupBox("Hardware Connection")
         conn_layout = QGridLayout()
 
         self.btn_cam_connect = QPushButton("카메라 연결")
         self.btn_stage_connect = QPushButton("스테이지 연결")
 
-        # COM 포트 자동 스캔
         self.combo_com_port = QComboBox()
         available_ports = [port.device for port in serial.tools.list_ports.comports()]
         if available_ports:
             self.combo_com_port.addItems(available_ports)
         else:
-            self.combo_com_port.addItem("COM3")  # 스캔된 포트가 없으면 기본값
+            self.combo_com_port.addItem("COM3")
 
-        conn_layout.addWidget(self.btn_cam_connect, 0, 0, 1, 2)
+        self.btn_find_index = QPushButton("Find Index (영점)")
+        self.btn_find_index.setStyleSheet("background-color: #FFE082; font-weight: bold;")
+        self.btn_find_index.clicked.connect(self.main_window.run_find_index)
+        self.btn_find_index.setEnabled(False)
+
+        conn_layout.addWidget(self.btn_cam_connect, 0, 0, 1, 3)
         conn_layout.addWidget(QLabel("Stage Port:"), 1, 0)
-        conn_layout.addWidget(self.combo_com_port, 1, 1)
+        conn_layout.addWidget(self.combo_com_port, 1, 1, 1, 2)
         conn_layout.addWidget(self.btn_stage_connect, 2, 0, 1, 2)
+        conn_layout.addWidget(self.btn_find_index, 2, 2, 1, 1)
 
         self.btn_cam_connect.clicked.connect(self.main_window.toggle_camera)
         self.btn_stage_connect.clicked.connect(self.main_window.toggle_stage)
         conn_group.setLayout(conn_layout)
         scroll_layout.addWidget(conn_group)
 
-        # [2. 카메라 설정 (쿨러 제어 및 실시간 온도 표시창 추가)]
+        # [2. Camera Settings]
         cam_group = QGroupBox("Camera Settings")
         cam_layout = QFormLayout()
 
@@ -2155,11 +2201,9 @@ class ControlPanelWidget(QWidget):
         self.chk_cooler.setChecked(True)
         self.chk_cooler.stateChanged.connect(lambda state: self.main_window.cam.set_cooler(bool(state)))
 
-        # [신규] 현재 온도를 표시할 라벨 생성
         self.lbl_sensor_temp = QLabel("현재 온도: -- ℃")
         self.lbl_sensor_temp.setStyleSheet("color: #00e5ff; font-weight: bold; margin-left: 10px;")
 
-        # 체크박스와 온도 라벨을 가로로 나란히 배치하기 위한 레이아웃
         cooler_layout = QHBoxLayout()
         cooler_layout.addWidget(self.chk_cooler)
         cooler_layout.addWidget(self.lbl_sensor_temp)
@@ -2172,14 +2216,13 @@ class ControlPanelWidget(QWidget):
         self.binning_combo.addItems(["1x1", "2x2", "4x4"])
 
         roi_layout = QHBoxLayout()
-        self.roi_start = QLineEdit("1144") # ROI(532 : 1144 / 785 : 1188)
-        self.roi_height = QLineEdit("8") # ROI-height(532 : 16 / 785 : 8)
+        self.roi_start = QLineEdit("1144")
+        self.roi_height = QLineEdit("8")
         roi_layout.addWidget(QLabel("Y:"));
         roi_layout.addWidget(self.roi_start)
         roi_layout.addWidget(QLabel("H:"));
         roi_layout.addWidget(self.roi_height)
 
-        # 폼 레이아웃에 가로 레이아웃(cooler_layout) 추가
         cam_layout.addRow("센서 쿨러:", cooler_layout)
         cam_layout.addRow("센서 모드:", self.sensor_mode_combo)
         cam_layout.addRow("노출 시간(s):", self.exposure_input)
@@ -2192,11 +2235,11 @@ class ControlPanelWidget(QWidget):
         cam_group.setLayout(cam_layout)
         scroll_layout.addWidget(cam_group)
 
-        # [신규] 센서 온도 실시간 갱신용 타이머 설정 (2초마다 실행)
         self.cooler_timer = QTimer()
         self.cooler_timer.timeout.connect(self.update_sensor_temperature)
         self.cooler_timer.start(2000)
 
+        # [3. Calibration Settings]
         calib_group = QGroupBox("Calibration Settings")
         calib_layout = QGridLayout()
         self.btn_auto_si = QPushButton("Si 피크 자동 보정 (520 cm⁻¹)")
@@ -2208,58 +2251,40 @@ class ControlPanelWidget(QWidget):
         self.spin_laser.setRange(200, 1500);
         self.spin_laser.setValue(532.0)
         calib_layout.addWidget(self.spin_laser, 1, 1)
+
         self.px1 = QDoubleSpinBox();
         self.px1.setRange(0, 4096);
         self.px1.setDecimals(1);
-        self.px1.setValue(2244) # pixel-laser(532 : 2250 / 785(GaN-E2h) : 3928)
+        self.px1.setValue(2244)
         self.wl1 = QDoubleSpinBox();
         self.wl1.setRange(200, 1500);
         self.wl1.setDecimals(2);
-        self.wl1.setValue(532) # wavelength-Laser(532 : 532 / 785(GaN-E2h) : 821.77)
+        self.wl1.setValue(532)
         calib_layout.addWidget(self.px1, 3, 0);
         calib_layout.addWidget(self.wl1, 3, 1)
 
         self.px2 = QDoubleSpinBox();
         self.px2.setRange(0, 4096);
         self.px2.setDecimals(1);
-        self.px2.setValue(532) # pixel-stokes(532 : 1649 / 785(CNT-G) : 879)
+        self.px2.setValue(1649)
         self.wl2 = QDoubleSpinBox();
         self.wl2.setRange(200, 1500);
         self.wl2.setDecimals(2);
-        self.wl2.setValue(547.14) # wavelength-stokes(532 : 547.10 / 785(CNT-G) : 895.15)
+        self.wl2.setValue(547.14)
         calib_layout.addWidget(self.px2, 4, 0);
         calib_layout.addWidget(self.wl2, 4, 1)
 
         self.px3 = QDoubleSpinBox();
         self.px3.setRange(0, 4096);
         self.px3.setDecimals(1);
-        self.px3.setValue(2805) # pixel-anti-stokes(532 : 2810 / 785(Si) : 4055)
+        self.px3.setValue(2805)
         self.wl3 = QDoubleSpinBox();
         self.wl3.setRange(200, 1500);
         self.wl3.setDecimals(2);
-        self.wl3.setValue(517.68) # wavelength-anti-stokes(532 : 517.60 / 785(Si) : 818.41)
+        self.wl3.setValue(517.68)
         calib_layout.addWidget(self.px3, 5, 0);
         calib_layout.addWidget(self.wl3, 5, 1)
-        self.px2 = QDoubleSpinBox();
-        self.px2.setRange(0, 4096);
-        self.px2.setDecimals(1);
-        self.px2.setValue(2805) # pixel-anti-stokes(532 : 2810 / 785(Si) : 4055)
-        self.wl2 = QDoubleSpinBox();
-        self.wl2.setRange(200, 1500);
-        self.wl2.setDecimals(2);
-        self.wl2.setValue(517.68)# wavelength-anti-stokes(532 : 517.60 / 785(Si) : 818.41)
-        calib_layout.addWidget(self.px2, 4, 0);
-        calib_layout.addWidget(self.wl2, 4, 1)
-        self.px3 = QDoubleSpinBox();
-        self.px3.setRange(0, 4096);
-        self.px3.setDecimals(1);
-        self.px3.setValue(1649) # pixel-stokes(532 : 1649 / 785(CNT-G) : 879)
-        self.wl3 = QDoubleSpinBox();
-        self.wl3.setRange(200, 1500);
-        self.wl3.setDecimals(2);
-        self.wl3.setValue(547.14) # wavelength-stokes(532 : 547.10 / 785(CNT-G) : 895.15)
-        calib_layout.addWidget(self.px3, 5, 0);
-        calib_layout.addWidget(self.wl3, 5, 1)
+
         self.btn_apply_calib = QPushButton("3-Point 다항 보정 적용")
         self.btn_apply_calib.setStyleSheet("background-color: #3F51B5; color: white;")
         self.btn_apply_calib.clicked.connect(self.apply_3pt_calibration)
@@ -2267,6 +2292,7 @@ class ControlPanelWidget(QWidget):
         calib_group.setLayout(calib_layout)
         scroll_layout.addWidget(calib_group)
 
+        # [4. Temperature Analysis Manager]
         peak_group = QGroupBox("Temperature Analysis Manager")
         self.peak_layout = QVBoxLayout()
         self.btn_add_pair = QPushButton("➕ 온도 측정 쌍 추가")
@@ -2277,201 +2303,149 @@ class ControlPanelWidget(QWidget):
         peak_group.setLayout(self.peak_layout)
         scroll_layout.addWidget(peak_group)
 
-        stage_group = QGroupBox("Piezo Stage Control")
-        stage_layout = QGridLayout()
+        # ==========================================
+        # 🚨 [5. NEW Piezo Stage Control 통합 패널] 🚨
+        # ==========================================
+        stage_master_group = QGroupBox("Piezo Stage Control")
+        stage_master_layout = QVBoxLayout()
 
-        # 🚨 [신규 추가] 1. 현재 위치 인디케이터 및 영점 리셋 버튼
-        pos_layout = QHBoxLayout()
-        self.pos_label = QLabel("X: 0.00 | Y: 0.00 | Z: 0.00")
-        self.pos_label.setStyleSheet(
-            "color: #00e5ff; background-color: #2b2b2b; font-weight: bold; padding: 5px; border-radius: 3px; font-family: Consolas, Monaco, monospace;")
+        # --- A. Current Position ---
+        pos_group = QGroupBox("Current Position & Zero")
+        pos_layout = QGridLayout()
 
-        self.btn_zero_reset = QPushButton("⌖ 영점 리셋")
-        self.btn_zero_reset.setStyleSheet("background-color: #607D8B; color: white; font-weight: bold; padding: 4px;")
-        self.btn_zero_reset.clicked.connect(self.reset_stage_zero)
+        self.chk_auto_update = QCheckBox("Auto Update (10Hz)")
+        self.chk_auto_update.setChecked(True)
+        self.chk_auto_update.stateChanged.connect(self.toggle_auto_update)
 
-        pos_layout.addWidget(self.pos_label, 7)
-        pos_layout.addWidget(self.btn_zero_reset, 3)
-        stage_layout.addLayout(pos_layout, 0, 0, 1, 4)
+        self.btn_refresh = QPushButton("🔄 수동 업데이트")
+        self.btn_refresh.setStyleSheet("background-color: #BBDEFB; font-weight: bold;")
+        self.btn_refresh.clicked.connect(self.manual_update_indicator)
 
-        # 2. 스텝 / 연속 모드 라디오 버튼 (행 번호 1로 이동)
-        mode_layout = QHBoxLayout()
-        self.radio_step = QRadioButton("Step")
-        self.radio_cont = QRadioButton("Continuous")
-        self.radio_cont.setChecked(True)
-        mode_layout.addWidget(self.radio_step)
-        mode_layout.addWidget(self.radio_cont)
-        stage_layout.addLayout(mode_layout, 1, 0, 1, 4)
+        self.chk_absolute = QCheckBox("Show Absolute (Hardware) Position")
 
-        # 3. 속도 및 스텝 크기 (행 번호 2, 3으로 이동)
+        self.lbl_x = QLabel("X: 0.000 µm")
+        self.lbl_y = QLabel("Y: 0.000 µm")
+        self.lbl_z = QLabel("Z: 0.000 µm")
+        font = self.lbl_x.font();
+        font.setPointSize(12);
+        font.setBold(True)
+        self.lbl_x.setFont(font);
+        self.lbl_y.setFont(font);
+        self.lbl_z.setFont(font)
+
+        self.btn_set_zero = QPushButton("SET ZERO (현재 위치를 상대 영점으로)")
+        self.btn_set_zero.setStyleSheet("background-color: #C8E6C9;")
+        self.btn_set_zero.clicked.connect(self.set_zero)
+
+        pos_layout.addWidget(self.chk_auto_update, 0, 0)
+        pos_layout.addWidget(self.btn_refresh, 0, 1)
+        pos_layout.addWidget(self.chk_absolute, 1, 0, 1, 2)
+        pos_layout.addWidget(self.lbl_x, 2, 0, 1, 2)
+        pos_layout.addWidget(self.lbl_y, 3, 0, 1, 2)
+        pos_layout.addWidget(self.lbl_z, 4, 0, 1, 2)
+        pos_layout.addWidget(self.btn_set_zero, 5, 0, 1, 2)
+        pos_group.setLayout(pos_layout)
+        stage_master_layout.addWidget(pos_group)
+
+        # --- B. Go To ---
+        go_group = QGroupBox("Saved / Target Position (Go To)")
+        go_layout = QGridLayout()
+
+        self.radio_go_rel = QRadioButton("Relative")
+        self.radio_go_abs = QRadioButton("Absolute")
+        self.radio_go_abs.setChecked(True)
+
+        self.input_go_x = QDoubleSpinBox();
+        self.input_go_x.setRange(-25000, 25000);
+        self.input_go_x.setDecimals(3)
+        self.input_go_y = QDoubleSpinBox();
+        self.input_go_y.setRange(-25000, 25000);
+        self.input_go_y.setDecimals(3)
+        self.input_go_z = QDoubleSpinBox();
+        self.input_go_z.setRange(-25000, 25000);
+        self.input_go_z.setDecimals(3)
+
+        self.btn_go = QPushButton("GO")
+        self.btn_go.setStyleSheet("background-color: #AED581; font-weight: bold; height: 30px;")
+        self.btn_go.clicked.connect(self.go_target)
+
+        go_layout.addWidget(self.radio_go_abs, 0, 0)
+        go_layout.addWidget(self.radio_go_rel, 0, 1)
+        go_layout.addWidget(QLabel("X:"), 1, 0);
+        go_layout.addWidget(self.input_go_x, 1, 1)
+        go_layout.addWidget(QLabel("Y:"), 2, 0);
+        go_layout.addWidget(self.input_go_y, 2, 1)
+        go_layout.addWidget(QLabel("Z:"), 3, 0);
+        go_layout.addWidget(self.input_go_z, 3, 1)
+        go_layout.addWidget(self.btn_go, 4, 0, 1, 2)
+        go_group.setLayout(go_layout)
+        stage_master_layout.addWidget(go_group)
+
+        # --- C. Motion Control ---
+        ctrl_group = QGroupBox("Motion Control (Speed & Mode)")
+        ctrl_layout = QGridLayout()
+
         self.spin_speed = QDoubleSpinBox()
-        self.spin_speed.setRange(0.1, 1000)
-        self.spin_speed.setPrefix("이동 속도: ")
-        self.spin_speed.setSuffix(" μm/s")
-        self.spin_speed.setValue(100)
-        self.spin_speed.valueChanged.connect(self.update_stage_speed)
-        stage_layout.addWidget(self.spin_speed, 2, 0, 1, 4)
+        self.spin_speed.setRange(0.1, 8000)
+        self.spin_speed.setValue(1000)
+        self.spin_speed.setSuffix(" µm/s")
+        self.btn_apply_speed = QPushButton("Apply Speed")
+        self.btn_apply_speed.clicked.connect(self.apply_speed)
+
+        self.radio_jog_step = QRadioButton("Stepping")
+        self.radio_jog_cont = QRadioButton("Continuous")
+        self.radio_jog_step.setChecked(True)
 
         self.spin_step = QDoubleSpinBox()
-        self.spin_step.setRange(0.01, 100)
-        self.spin_step.setPrefix("Step 크기: ")
-        self.spin_step.setSuffix(" μm")
-        self.spin_step.setValue(1)
-        stage_layout.addWidget(self.spin_step, 3, 0, 1, 4)
+        self.spin_step.setRange(0.001, 1000)
+        self.spin_step.setValue(1.0)
+        self.spin_step.setSuffix(" µm")
 
-        # 4. 조그 버튼 배치 (행 번호 4, 5, 6으로 이동)
-        self.btn_x_minus = QPushButton("X-")
-        self.btn_x_plus = QPushButton("X+")
-        self.btn_y_minus = QPushButton("Y-")
-        self.btn_y_plus = QPushButton("Y+")
-        self.btn_z_minus = QPushButton("Z- (Dn)")
-        self.btn_z_plus = QPushButton("Z+ (Up)")
+        ctrl_layout.addWidget(QLabel("Speed:"), 0, 0)
+        ctrl_layout.addWidget(self.spin_speed, 0, 1)
+        ctrl_layout.addWidget(self.btn_apply_speed, 0, 2)
+        ctrl_layout.addWidget(self.radio_jog_step, 1, 0)
+        ctrl_layout.addWidget(self.radio_jog_cont, 1, 1)
+        ctrl_layout.addWidget(QLabel("Move Step:"), 2, 0)
+        ctrl_layout.addWidget(self.spin_step, 2, 1)
+        ctrl_group.setLayout(ctrl_layout)
+        stage_master_layout.addWidget(ctrl_group)
 
-        stage_layout.addWidget(self.btn_y_plus, 4, 1)
-        stage_layout.addWidget(self.btn_x_minus, 5, 0)
-        stage_layout.addWidget(self.btn_y_minus, 6, 1)
-        stage_layout.addWidget(self.btn_x_plus, 5, 2)
-        stage_layout.addWidget(self.btn_z_plus, 4, 3)
-        stage_layout.addWidget(self.btn_z_minus, 6, 3)
+        # --- D. Jog ---
+        jog_group = QGroupBox("Relative Motion (Jog)")
+        jog_layout = QGridLayout()
 
-        # 조그 버튼 이벤트 연결 (기존 코드가 이 형태라면 유지, 다르면 양식에 맞추시면 됩니다)
-        self.btn_x_plus.clicked.connect(lambda *args: self.jog_stage(1, 0, 0))
-        self.btn_x_minus.clicked.connect(lambda *args: self.jog_stage(-1, 0, 0))
-        self.btn_y_plus.clicked.connect(lambda *args: self.jog_stage(0, 1, 0))
-        self.btn_y_minus.clicked.connect(lambda *args: self.jog_stage(0, -1, 0))
-        self.btn_z_plus.clicked.connect(lambda *args: self.jog_stage(0, 0, 1))
-        self.btn_z_minus.clicked.connect(lambda *args: self.jog_stage(0, 0, -1))
+        self.btn_y_plus = QPushButton("∧\n+y")
+        self.btn_y_minus = QPushButton("∨\n-y")
+        self.btn_x_minus = QPushButton("<\n-x")
+        self.btn_x_plus = QPushButton(">\n+x")
+        self.btn_z_plus = QPushButton("∧\n(+z)")
+        self.btn_z_minus = QPushButton("∨\n(-z)")
+        self.btn_stop = QPushButton("STOP")
+        self.btn_stop.setStyleSheet("background-color: #EF9A9A; font-weight: bold;")
+        self.btn_stop.clicked.connect(lambda: self.main_window.stage.stop_motion())
 
-        # 💡 [신규 추가] 스테이지 수동 제어부 (Absolute Move)
-        stage_move_group = QGroupBox("스테이지 수동 이동 (XYZ)")
-        stage_move_layout = QGridLayout()
+        self.setup_jog_btn(self.btn_y_plus, 0, 1, 0)
+        self.setup_jog_btn(self.btn_y_minus, 0, -1, 0)
+        self.setup_jog_btn(self.btn_x_plus, 1, 0, 0)
+        self.setup_jog_btn(self.btn_x_minus, -1, 0, 0)
+        self.setup_jog_btn(self.btn_z_plus, 0, 0, 1)
+        self.setup_jog_btn(self.btn_z_minus, 0, 0, -1)
 
-        # [신규] 기계(하드웨어) 절대 위치 인디케이터 및 읽기 버튼
-        abs_pos_layout = QHBoxLayout()
-        self.lbl_abs_pos = QLabel("하드웨어 절대 위치: 미확인")
-        self.lbl_abs_pos.setStyleSheet(
-            "color: #ff9800; background-color: #2b2b2b; font-weight: bold; padding: 4px; border-radius: 3px; font-family: Consolas, Monaco, monospace;")
-        self.btn_read_abs = QPushButton("🔄 절대 위치 읽기")
-        self.btn_read_abs.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
-        self.btn_read_abs.clicked.connect(self.read_absolute_position)
+        jog_layout.addWidget(self.btn_y_plus, 0, 1)
+        jog_layout.addWidget(self.btn_x_minus, 1, 0)
+        jog_layout.addWidget(self.btn_x_plus, 1, 2)
+        jog_layout.addWidget(self.btn_y_minus, 2, 1)
+        jog_layout.addWidget(self.btn_z_plus, 0, 3)
+        jog_layout.addWidget(self.btn_z_minus, 2, 3)
+        jog_layout.addWidget(self.btn_stop, 3, 0, 1, 4)
+        jog_group.setLayout(jog_layout)
+        stage_master_layout.addWidget(jog_group)
 
-        abs_pos_layout.addWidget(self.lbl_abs_pos, 7)
-        abs_pos_layout.addWidget(self.btn_read_abs, 3)
-        stage_move_layout.addLayout(abs_pos_layout, 0, 0, 1, 2)
+        stage_master_group.setLayout(stage_master_layout)
+        scroll_layout.addWidget(stage_master_group)
 
-        # XYZ 입력 스핀박스 생성 (-2000 ~ 2000 범위로 넉넉하게 확장)
-        self.spin_move_x = QDoubleSpinBox();
-        self.spin_move_x.setRange(-2000, 2000);
-        self.spin_move_x.setDecimals(3)
-        self.spin_move_y = QDoubleSpinBox();
-        self.spin_move_y.setRange(-2000, 2000);
-        self.spin_move_y.setDecimals(3)
-        self.spin_move_z = QDoubleSpinBox();
-        self.spin_move_z.setRange(-2000, 2000);
-        self.spin_move_z.setDecimals(3)
-
-        self.btn_set_zero = QPushButton("📍 현재 위치를 논리적 영점으로 (Set Zero)")
-        self.btn_set_zero.setStyleSheet("background-color: #607D8B; color: white; font-weight: bold; height: 30px;")
-        self.btn_set_zero.clicked.connect(self.set_stage_zero)
-
-        self.btn_stage_go = QPushButton("🚀 입력 위치로 이동 (논리 좌표)")
-        self.btn_stage_go.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; height: 30px;")
-        self.btn_stage_go.clicked.connect(self.move_stage_logical)
-
-        # [신규] 기계 절대 좌표 이동 버튼
-        self.btn_stage_go_abs = QPushButton("🚨 입력 위치로 이동 (기계 절대 좌표)")
-        self.btn_stage_go_abs.setStyleSheet("background-color: #E91E63; color: white; font-weight: bold; height: 30px;")
-        self.btn_stage_go_abs.clicked.connect(self.move_stage_hardware_absolute)
-
-        stage_move_layout.addWidget(QLabel("X (μm):"), 1, 0)
-        stage_move_layout.addWidget(self.spin_move_x, 1, 1)
-        stage_move_layout.addWidget(QLabel("Y (μm):"), 2, 0)
-        stage_move_layout.addWidget(self.spin_move_y, 2, 1)
-        stage_move_layout.addWidget(QLabel("Z (μm):"), 3, 0)
-        stage_move_layout.addWidget(self.spin_move_z, 3, 1)
-
-        stage_move_layout.addWidget(self.btn_set_zero, 4, 0, 1, 2)
-        stage_move_layout.addWidget(self.btn_stage_go, 5, 0, 1, 2)
-        stage_move_layout.addWidget(self.btn_stage_go_abs, 6, 0, 1, 2)
-
-        stage_move_group.setLayout(stage_move_layout)
-
-        stage_group.setLayout(stage_layout)
-        scroll_layout.addWidget(stage_group)
-
-        # 💡 [신규] 콤팩트 절대 좌표 및 영점 제어 패널
-        abs_control_group = QGroupBox("📍 절대 좌표 및 영점 제어")
-        abs_layout = QVBoxLayout()
-        abs_layout.setContentsMargins(5, 5, 5, 5)  # 여백을 확 줄여서 작게 만듭니다
-        abs_layout.setSpacing(5)
-
-        # 1. 하드웨어 위치 확인 (한 줄로 얇게)
-        pos_layout = QHBoxLayout()
-        self.lbl_abs_pos = QLabel("Abs: 미확인")
-        self.lbl_abs_pos.setStyleSheet("color: #ff9800; font-weight: bold; font-size: 11px;")
-        self.btn_read_abs = QPushButton("🔄 읽기")
-        self.btn_read_abs.setFixedHeight(22)
-        self.btn_read_abs.clicked.connect(self.read_absolute_position)
-        pos_layout.addWidget(self.lbl_abs_pos, stretch=1)
-        pos_layout.addWidget(self.btn_read_abs)
-        abs_layout.addLayout(pos_layout)
-
-        # 2. XYZ 숫자 입력창 (가로로 촘촘하게 한 줄 - 범위를 25000으로 확장)
-        input_layout = QHBoxLayout()
-        self.spin_move_x = QDoubleSpinBox();
-        self.spin_move_x.setRange(-25000, 25000);
-        self.spin_move_x.setDecimals(2)
-        self.spin_move_y = QDoubleSpinBox();
-        self.spin_move_y.setRange(-25000, 25000);
-        self.spin_move_y.setDecimals(2)
-        self.spin_move_z = QDoubleSpinBox();
-        self.spin_move_z.setRange(-25000, 25000);
-        self.spin_move_z.setDecimals(2)
-
-        # 🚨 [수정] setMinWidth -> setMinimumWidth 로 오타 수정
-        self.spin_move_x.setMinimumWidth(75)
-        self.spin_move_y.setMinimumWidth(75)
-        self.spin_move_z.setMinimumWidth(75)
-
-        input_layout.addWidget(QLabel("X:"));
-        input_layout.addWidget(self.spin_move_x)
-        input_layout.addWidget(QLabel("Y:"));
-        input_layout.addWidget(self.spin_move_y)
-        input_layout.addWidget(QLabel("Z:"));
-        input_layout.addWidget(self.spin_move_z)
-        abs_layout.addLayout(input_layout)
-
-        # 3. 제어 버튼들 (영점은 길게, 이동은 반반씩)
-        self.btn_set_zero = QPushButton("📍 현재 위치를 논리적 영점(0)으로")
-        self.btn_set_zero.setFixedHeight(24)
-        self.btn_set_zero.clicked.connect(self.set_stage_zero)
-        abs_layout.addWidget(self.btn_set_zero)
-
-        btn_go_layout = QHBoxLayout()
-        self.btn_stage_go = QPushButton("🚀 논리 좌표 이동")
-        self.btn_stage_go.setFixedHeight(24)
-        self.btn_stage_go.clicked.connect(self.move_stage_logical)
-
-        self.btn_stage_go_abs = QPushButton("🚨 기계 절대 이동")
-        self.btn_stage_go_abs.setStyleSheet("background-color: #E91E63; color: white; font-weight: bold;")
-        self.btn_stage_go_abs.setFixedHeight(24)
-        self.btn_stage_go_abs.clicked.connect(self.move_stage_hardware_absolute)
-
-        btn_go_layout.addWidget(self.btn_stage_go)
-        btn_go_layout.addWidget(self.btn_stage_go_abs)
-        abs_layout.addLayout(btn_go_layout)
-
-        abs_control_group.setLayout(abs_layout)
-
-        # 🚨 메인 패널 레이아웃에 콤팩트 그룹박스 추가
-        if self.layout() is not None:
-            self.layout().addWidget(abs_control_group)
-        else:
-            try:
-                layout.addWidget(abs_control_group)
-            except NameError:
-                pass
-
+        # [6. Live View Start]
         self.btn_start_meas = QPushButton("▶ 라이브 뷰/스펙트럼 모니터링 시작")
         self.btn_start_meas.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; height: 35px;")
         self.btn_start_meas.clicked.connect(self.main_window.toggle_measurement)
@@ -2481,52 +2455,104 @@ class ControlPanelWidget(QWidget):
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
 
-    def jog_stage(self, dx_dir, dy_dir, dz_dir):
-        try:
-            stage_obj = getattr(self.main_window, 'stage', None)
-            if stage_obj and stage_obj.is_connected:
-                step = self.spin_step.value()
+        # --- 백그라운드 위치 타이머 설정 ---
+        self._is_updating = False
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.auto_update_indicator)
+        self.update_timer.start(100)
 
-                # 💡 [핵심] set_speed(speed) 삭제됨! 오직 이동 명령 한 발만 쏨!
-                stage_obj.move_relative(dx_dir * step, dy_dir * step, dz_dir * step)
-
-                self.update_stage_position()
-                print(f"[Stage] Jog 이동 -> X:{dx_dir * step}, Y:{dy_dir * step}, Z:{dz_dir * step}")
-        except Exception as e:
-            print(f"[Stage] 조그 에러: {e}")
-
-        # 🚨 [신규 추가] 현재 피에조 장비의 좌표를 읽어와 화면 인디케이터를 갱신하는 함수
-    def update_stage_position(self):
-        stage_obj = getattr(self.main_window, 'stage', None)
-        if stage_obj:
-            self.pos_label.setText(
-                f"X: {stage_obj.logical_x:.2f} | Y: {stage_obj.logical_y:.2f} | Z: {stage_obj.logical_z:.2f}")
-
-    # 🚨 [신규 추가] 현재 하드웨어 위치는 그대로 두고, 소프트웨어 좌표계 기준만 (0,0,0)으로 초기화
-    def reset_stage_zero(self):
-        stage_obj = getattr(self.main_window, 'stage', None)
-        if stage_obj:
-            stage_obj.logical_x = 0.0
-            stage_obj.logical_y = 0.0
-            stage_obj.logical_z = 0.0
-
-            # 인디케이터 갱신
-            self.update_stage_position()
-            print("[Stage] 현재 스테이지 위치를 기준 영점(0, 0, 0)으로 재설정했습니다.")
-
-    def move_stage_absolute(self):
-        """입력된 XYZ 좌표로 스테이지를 즉시 이동시킵니다."""
-        if hasattr(self.main_window, 'stage') and self.main_window.stage.is_connected:
-            target_x = self.spin_move_x.value()
-            target_y = self.spin_move_y.value()
-            target_z = self.spin_move_z.value()
-
-            # 절대 좌표 이동 명령 전송
-            self.main_window.stage.move_absolute(target_x, target_y, target_z)
-            print(f"[Stage] 수동 이동 완료: X={target_x}, Y={target_y}, Z={target_z}")
+    # ---------------- Piezo UI Action Methods ----------------
+    def toggle_auto_update(self, state):
+        if state == Qt.CheckState.Checked.value:
+            self.update_timer.start(100)
         else:
-            QMessageBox.warning(self, "경고", "스테이지가 연결되어 있지 않습니다. 먼저 연결을 확인해 주세요.")
+            self.update_timer.stop()
 
+    def auto_update_indicator(self):
+        if getattr(self, '_is_updating', False): return
+        self._is_updating = True
+        try:
+            self._update_ui_labels()
+        except Exception as e:
+            pass
+        finally:
+            self._is_updating = False
+
+    def manual_update_indicator(self):
+        if not self.main_window.stage.is_connected:
+            QMessageBox.warning(self, "오류", "스테이지가 연결되어 있지 않습니다.")
+            return
+        self._update_ui_labels()
+        print("[UI] 위치 수동 업데이트 완료")
+
+    def _update_ui_labels(self):
+        if self.main_window.stage.is_connected:
+            log_x, log_y, log_z = self.main_window.stage.read_position()
+
+            if self.chk_absolute.isChecked():
+                self.lbl_x.setText(f"X: {self.main_window.stage.hard_x:.3f} µm (Abs)")
+                self.lbl_y.setText(f"Y: {self.main_window.stage.hard_y:.3f} µm (Abs)")
+                self.lbl_z.setText(f"Z: {self.main_window.stage.hard_z:.3f} µm (Abs)")
+            else:
+                self.lbl_x.setText(f"X: {log_x:.3f} µm")
+                self.lbl_y.setText(f"Y: {log_y:.3f} µm")
+                self.lbl_z.setText(f"Z: {log_z:.3f} µm")
+
+    def set_zero(self):
+        if self.main_window.stage.is_connected:
+            # 🚨 1. 통신 충돌 방지를 위해 자동 업데이트 타이머 임시 정지
+            timer_was_active = False
+            if hasattr(self, 'update_timer') and self.update_timer.isActive():
+                self.update_timer.stop()
+                timer_was_active = True
+
+            # 2. 영점 설정 및 UI 즉시 갱신
+            self.main_window.stage.set_zero()
+            self._update_ui_labels()
+
+            # 🚨 3. 영점 설정 완료 후 타이머 원상복구
+            if timer_was_active:
+                self.update_timer.start(100)
+
+    def apply_speed(self):
+        if self.main_window.stage.is_connected:
+            self.main_window.stage.set_speed(self.spin_speed.value())
+
+    def go_target(self):
+        if not self.main_window.stage.is_connected: return
+        x = self.input_go_x.value()
+        y = self.input_go_y.value()
+        z = self.input_go_z.value()
+
+        if self.radio_go_abs.isChecked():
+            self.main_window.stage.move_absolute(x, y, z)
+        else:
+            self.main_window.stage.move_relative(x, y, z)
+
+        QTimer.singleShot(100, self._update_ui_labels)
+
+    def setup_jog_btn(self, btn, dx, dy, dz):
+        btn.pressed.connect(lambda: self.jog_start(dx, dy, dz))
+        btn.released.connect(self.jog_stop)
+
+    def jog_start(self, dx, dy, dz):
+        if not self.main_window.stage.is_connected: return
+
+        if self.radio_jog_step.isChecked():
+            step = self.spin_step.value()
+            self.main_window.stage.move_relative(dx * step, dy * step, dz * step)
+            QTimer.singleShot(100, self._update_ui_labels)
+        else:
+            large_step = 10000.0
+            self.main_window.stage.move_relative(dx * large_step, dy * large_step, dz * large_step)
+
+    def jog_stop(self):
+        if not self.main_window.stage.is_connected: return
+        if self.radio_jog_cont.isChecked():
+            self.main_window.stage.stop_motion()
+            QTimer.singleShot(200, self._update_ui_labels)
+
+    # ---------------- Camera & General Methods ----------------
     def apply_camera_settings(self):
         cam = self.main_window.cam
         if not cam.is_connected: return
@@ -2538,42 +2564,27 @@ class ControlPanelWidget(QWidget):
             pass
 
     def apply_auto_si_calibration(self):
-        from scipy.signal import find_peaks  # 다중 피크 탐지용 라이브러리 추가
-
+        from scipy.signal import find_peaks
         try:
             spectrum = getattr(self.main_window.spectrum_view, 'current_y_data', None)
-            if spectrum is None or len(spectrum) == 0:
-                print("[Auto Calib] 에러: 라이브 스펙트럼 데이터가 없습니다. 먼저 측정을 시작해 주세요.")
-                return
+            if spectrum is None or len(spectrum) == 0: return
 
-            # 1. 화면을 반으로 나누어 왼쪽/오른쪽 영역 분리 (Notch 필터 부근 마진 50px 제외)
             mid_idx = len(spectrum) // 2
             margin = 50
             left_region = spectrum[:mid_idx - margin]
             right_region = spectrum[mid_idx + margin:]
 
-            # 2. Scipy find_peaks로 노이즈가 아닌 뚜렷한 피크 모두 탐지
-            # prominence를 각 영역 최대값의 5%로 설정하여 가짜 노이즈 무시
             prom_left = np.max(left_region) * 0.05
             peaks_left, _ = find_peaks(left_region, prominence=prom_left)
 
             prom_right = np.max(right_region) * 0.05
             peaks_right, _ = find_peaks(right_region, prominence=prom_right)
 
-            if len(peaks_left) == 0 or len(peaks_right) == 0:
-                print("[Auto Calib] 에러: 양쪽에서 뚜렷한 피크를 찾지 못했습니다. 레이저 상태를 확인하세요.")
-                return
+            if len(peaks_left) == 0 or len(peaks_right) == 0: return
 
-            # 3. [핵심 물리 로직] 520(Si)은 567(GaN)보다 레이저 중심(0 cm-1)에 무조건 더 가깝습니다.
-            # 따라서 찾은 피크들 중 '화면 중앙(mid_idx)'에 가장 가까운 피크가 Si 입니다.
-
-            # 왼쪽 영역에서는 인덱스가 가장 큰(가장 오른쪽) 피크
             px_left_si = peaks_left[-1]
-
-            # 오른쪽 영역에서는 인덱스가 가장 작은(가장 왼쪽) 피크 (원래 좌표계로 복구 + margin)
             px_right_si = peaks_right[0] + mid_idx + margin
 
-            # 4. 카메라 좌우 반전에 관계없이 더 강한 쪽을 무조건 Stokes로 판별
             if spectrum[px_left_si] > spectrum[px_right_si]:
                 px_stokes = px_left_si
                 px_anti_stokes = px_right_si
@@ -2581,30 +2592,19 @@ class ControlPanelWidget(QWidget):
                 px_stokes = px_right_si
                 px_anti_stokes = px_left_si
 
-            print(
-                f"[Auto Calib] 다중 피크(GaN/Si) 탐지 완료! -> Stokes(Si): {px_stokes}px, Anti-Stokes(Si): {px_anti_stokes}px")
-
-            # 5. Raman Shift 스케일 자동 계산 (Si 기준: ±520.45 cm⁻¹)
             shift_diff = 520.45 - (-520.45)
             px_diff = px_stokes - px_anti_stokes
 
-            if px_diff == 0:
-                print("[Auto Calib] 에러: 피크 간격이 0입니다.")
-                return
-
+            if px_diff == 0: return
             slope = shift_diff / px_diff
             intercept = 520.45 - (slope * px_stokes)
 
-            # 6. 새로운 X축 적용 및 캘리브레이션 락(Lock)
             new_x_axis = np.arange(len(spectrum)) * slope + intercept
             self.main_window.spectrum_view.x_axis = new_x_axis
             self.main_window.spectrum_view.is_calibrated = True
             self.main_window.spectrum_view.calibration_func = lambda px: px * slope + intercept
-
-            print("[Auto Calib] GaN을 완벽히 무시하고 Si 피크만 타겟팅한 보정이 적용되었습니다!")
-
         except Exception as e:
-            print(f"[Auto Calib] 자동 보정 중 에러 발생: {e}")
+            print(f"Auto Calib Error: {e}")
 
     def apply_3pt_calibration(self):
         laser_wl = self.spin_laser.value()
@@ -2614,61 +2614,25 @@ class ControlPanelWidget(QWidget):
             self.main_window.spectrum_view.apply_calibration_quadratic(pixels, wavelengths, laser_wl)
             self.main_window.statusBar().showMessage("3-Point 캘리브레이션 적용 완료!")
         except Exception as e:
-            # [수정] 에러가 나면 그냥 넘기지 않고 경고창을 띄워서 사용자에게 알려줌
             QMessageBox.critical(self, "Calibration Error", f"캘리브레이션 실패:\n{str(e)}")
 
     def add_temp_pair(self):
-        # 5가지 고유 색상 지정
         colors = ['#00e5ff', '#ff9800', '#00e676', '#e040fb', '#ffeb3b']
-
         new_id = len(self.active_pairs) + 1
         assigned_color = colors[(new_id - 1) % len(colors)]
-
         target_layout = self.main_window.spectrum_view.pair_control_layout
-
         pair = TempPair(new_id, self.main_window, target_layout, color_hex=assigned_color)
         self.active_pairs.append(pair)
-
-        # 🚨 에러 원인 완벽 해결: 원래 이름인 cards_layout으로 복구
         self.cards_layout.addWidget(pair.lbl_temp)
 
     def remove_temp_pair(self, pair):
         self.active_pairs.remove(pair)
         pair.remove_from_plot()
 
-    def setup_jog_button(self, btn, dx, dy, dz):
-        btn.pressed.connect(lambda: self.on_jog_pressed(dx, dy, dz))
-        btn.released.connect(self.on_jog_released)
-
-    def on_jog_pressed(self, dx, dy, dz):
-        stage = self.main_window.stage
-        if not stage.is_connected: return
-        if self.radio_step.isChecked():
-            stage.move_relative(dx * 1.0, dy * 1.0, dz * 1.0)
-            self.update_stage_position()
-        else:
-            self.current_jog_dir = (dx, dy, dz)
-            self.jog_timer.start(100)
-
-    def on_jog_released(self):
-        if self.radio_cont.isChecked(): self.jog_timer.stop()
-
-    def do_continuous_move(self):
-        stage = self.main_window.stage
-        dx, dy, dz = self.current_jog_dir
-        stage.move_relative(dx * 1.0, dy * 1.0, dz * 1.0)
-        self.update_stage_position()
-
-    def update_stage_position(self):
-        x, y, z = self.main_window.stage.get_position()
-        self.pos_label.setText(f"X: {x:.2f} | Y: {y:.2f} | Z: {z:.2f}")
-
     def update_sensor_temperature(self):
-        """2초마다 카메라 센서 온도를 읽어와서 UI를 업데이트합니다."""
         if self.main_window.cam.is_connected:
             temp = self.main_window.cam.get_temperature()
             if temp is not None:
-                # 온도가 영하로 떨어지면 색상을 다르게(파란색 계열) 표시
                 color = "#00e5ff" if temp < 0 else "#ff9800"
                 self.lbl_sensor_temp.setStyleSheet(f"color: {color}; font-weight: bold; margin-left: 10px;")
                 self.lbl_sensor_temp.setText(f"현재 온도: {temp:.1f} ℃")
@@ -2677,73 +2641,6 @@ class ControlPanelWidget(QWidget):
         else:
             self.lbl_sensor_temp.setStyleSheet("color: #888888; margin-left: 10px;")
             self.lbl_sensor_temp.setText("현재 온도: -- ℃ (연결 안 됨)")
-
-    def set_stage_zero(self):
-        """현재 위치를 새로운 영점으로 설정하고 입력창을 0으로 초기화합니다."""
-        if hasattr(self.main_window, 'stage') and self.main_window.stage.is_connected:
-            self.main_window.stage.set_zero()
-            # UI 값도 0으로 맞춰줌
-            self.spin_move_x.setValue(0.0)
-            self.spin_move_y.setValue(0.0)
-            self.spin_move_z.setValue(0.0)
-            QMessageBox.information(self, "안내", "현재 위치가 영점(0, 0, 0)으로 설정되었습니다.")
-        else:
-            QMessageBox.warning(self, "경고", "스테이지가 연결되어 있지 않습니다.")
-
-    def move_stage_logical(self):
-        """설정된 영점을 기준으로 타겟 좌표까지 안전하게 상대 이동합니다."""
-        if hasattr(self.main_window, 'stage') and self.main_window.stage.is_connected:
-            target_x = self.spin_move_x.value()
-            target_y = self.spin_move_y.value()
-            target_z = self.spin_move_z.value()
-
-            # 💡 위험한 move_absolute 대신 안전한 move_to_logical 사용
-            self.main_window.stage.move_to_logical(target_x, target_y, target_z)
-            print(f"[Stage] 이동 완료: 영점 기준 (X={target_x}, Y={target_y}, Z={target_z})")
-        else:
-            QMessageBox.warning(self, "경고", "스테이지가 연결되어 있지 않습니다.")
-
-    def read_absolute_position(self):
-        """하드웨어에서 직접 절대 위치를 읽어옵니다."""
-        if hasattr(self.main_window, 'stage') and self.main_window.stage.is_connected:
-            try:
-                abs_x, abs_y, abs_z = self.main_window.stage.get_hardware_position()
-                self.lbl_abs_pos.setText(f"Abs X:{abs_x:.2f} | Y:{abs_y:.2f} | Z:{abs_z:.2f}")
-
-                # 사용자가 쉽게 이동할 수 있도록, 읽어온 위치를 스핀박스(입력창)에 자동 입력해 줍니다.
-                self.spin_move_x.setValue(abs_x)
-                self.spin_move_y.setValue(abs_y)
-                self.spin_move_z.setValue(abs_z)
-
-            except Exception as e:
-                QMessageBox.warning(self, "오류", f"절대 위치를 읽어오는 중 에러가 발생했습니다:\n{e}")
-        else:
-            QMessageBox.warning(self, "경고", "스테이지가 연결되어 있지 않습니다.")
-
-    def move_stage_hardware_absolute(self):
-        """소프트웨어에 지정된 오프셋을 무시하고, 기계의 고유 절대 좌표로 바로 이동합니다."""
-        if hasattr(self.main_window, 'stage') and self.main_window.stage.is_connected:
-            target_x = self.spin_move_x.value()
-            target_y = self.spin_move_y.value()
-            target_z = self.spin_move_z.value()
-
-            try:
-                self.main_window.stage.move_hardware_absolute(target_x, target_y, target_z)
-                print(f"[Stage] 하드웨어 절대 좌표로 이동: X={target_x}, Y={target_y}, Z={target_z}")
-
-                # 이동이 끝난 후 인디케이터 갱신을 위해 한 번 더 읽어줍니다.
-                self.read_absolute_position()
-                self.update_stage_position()  # 기존 논리 좌표 UI도 동기화
-            except Exception as e:
-                QMessageBox.warning(self, "오류", f"절대 위치 이동 중 에러가 발생했습니다:\n{e}")
-        else:
-            QMessageBox.warning(self, "경고", "스테이지가 연결되어 있지 않습니다.")
-
-    def update_stage_speed(self):
-        stage = getattr(self.main_window, 'stage', None)
-        if stage and stage.is_connected:
-            stage.set_speed(self.spin_speed.value())
-            print(f"[Stage] 속도 변경됨: {self.spin_speed.value()} μm/s")
 
 # -------------------------------------------------------------------
 # 4. 메인 윈도우 (호스트)
@@ -2804,13 +2701,26 @@ class MainWindow(QMainWindow):
 
     def toggle_stage(self):
         if not self.stage.is_connected:
-            # 콤보박스에서 선택된 텍스트(예: "COM3")를 읽어와서 connect 함수에 전달
             selected_port = self.control_panel.combo_com_port.currentText()
             if self.stage.connect(port_name=selected_port):
                 self.control_panel.btn_stage_connect.setText("스테이지 연결 해제")
+                self.control_panel.btn_find_index.setEnabled(True)
+                self.control_panel.apply_speed()
+
+                if not self.stage.check_is_indexed():
+                    reply = QMessageBox.question(
+                        self, 'Hardware Index Not Found',
+                        '장비의 기계적 절대 영점(Index)이 설정되어 있지 않습니다.\n정확한 맵핑과 이동을 위해 지금 영점(INdex) 찾기를 수행하시겠습니까?',
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.run_find_index()
+            else:
+                QMessageBox.warning(self, "Error", f"{selected_port} 연결 실패")
         else:
             self.stage.disconnect()
             self.control_panel.btn_stage_connect.setText("스테이지 연결")
+            self.control_panel.btn_find_index.setEnabled(False)
 
     def toggle_measurement(self):
         if not self.is_measuring:
@@ -2837,6 +2747,27 @@ class MainWindow(QMainWindow):
         self.cam.uninitialize_dcam()
         self.stage.disconnect()
         event.accept()
+
+    def run_find_index(self):
+        if self.stage.is_connected:
+            # 🚨 1. 하드웨어가 영점을 찾는 동안 통신 과부하 방지
+            timer_was_active = False
+            if self.control_panel.chk_auto_update.isChecked():
+                self.control_panel.update_timer.stop()
+                timer_was_active = True
+
+            # 2. 하드웨어 영점(INdex) 탐색 명령 전송
+            self.stage.find_index()
+
+            QMessageBox.information(
+                self,
+                "진행 중",
+                "하드웨어 영점(Index) 탐색을 시작했습니다.\n모든 축이 기준점으로 이동할 때까지 잠시 기다려주세요."
+            )
+
+            # 🚨 3. 탐색 명령이 안전하게 들어간 후 타이머 복구
+            if timer_was_active:
+                self.control_panel.update_timer.start(100)
 
 
 if __name__ == "__main__":
