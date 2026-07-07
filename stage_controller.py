@@ -70,8 +70,7 @@ class PiezoController:
                         response = ""
                         while (time.time() - start_time) < 0.15:
                             if self.serial_conn.in_waiting:
-                                chunk = self.serial_conn.read(self.serial_conn.in_waiting).decode('ascii',
-                                                                                                  errors='ignore')
+                                chunk = self.serial_conn.read(self.serial_conn.in_waiting).decode('ascii', errors='ignore')
                                 response += chunk
                                 if '\n' in chunk or '\r' in chunk:
                                     break
@@ -95,7 +94,6 @@ class PiezoController:
         print("[Stage] Index(물리적 영점) 찾기 동작 시작...")
 
     def read_position(self):
-        """X, Y, Z를 개별적으로 요청하여 통신 누락 방지"""
         self.hard_x = self._query_single_axis('x')
         self.hard_y = self._query_single_axis('y')
         self.hard_z = self._query_single_axis('z')
@@ -148,7 +146,6 @@ class PiezoController:
         self.send_command(f"GT x{abs_x:.3f} y{abs_y:.3f} z{abs_z:.3f}")
 
     def move_to_logical(self, target_x, target_y, target_z, wait_ack=False):
-        """고속 맵핑을 위한 가변 패킷 이동 함수"""
         abs_target_x = target_x + self.offset_x
         abs_target_y = target_y + self.offset_y
         abs_target_z = target_z + self.offset_z
@@ -166,9 +163,13 @@ class PiezoController:
             cmd = " ".join(parts)
             self.send_command(cmd, wait_for_ack=wait_ack)
 
+    def set_trigger_out(self, axis='x', value='0.0'):
+        cmd = f"TO {axis}{value}"
+        self.send_command(cmd, wait_for_ack=True)
+        print(f"[Stage] Trigger Out 설정 완료: {cmd}")
+
     def stop_motion(self):
         self.send_command("SH x y z")
 
     def get_position(self):
-        """기존 main.py 호환을 위한 래퍼 함수"""
         return self.get_logical_position()
