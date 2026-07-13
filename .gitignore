@@ -1,0 +1,8 @@
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+
+# Stability patch local files
+*.bak_*
+.stability_patch_bundle/
