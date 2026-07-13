@@ -1,4 +1,5 @@
 import sys
+import logging
 import os
 import serial.tools.list_ports
 import numpy as np
@@ -22,6 +23,15 @@ from camera_controller import CameraController
 from stage_controller import PiezoController
 from raman_math import remove_als_baseline, calculate_temperature, apply_gaussian_1d, calibrate_raman_axis_quadratic
 from raman_ml import RamanMLProcessor
+# RAMAN_STABILITY_PATCH_V1
+from stability_utils import (
+    allocate_spectrum_cube,
+    install_global_exception_logging,
+    safe_eval_formula,
+    shutdown_hardware,
+    snapshot_temperature_pairs,
+)
+install_global_exception_logging()
 import pandas as pd
 from scipy.ndimage import median_filter
 from scipy.optimize import curve_fit
@@ -73,13 +83,9 @@ class CustomFormula:
 
     def evaluate(self, ch_values):
         try:
-            expr = self.expression
-            for ch_name in sorted(ch_values.keys(), key=len, reverse=True):
-                val = ch_values[ch_name]
-                if val is None or np.isnan(val): return np.nan
-                expr = expr.replace(ch_name, str(val))
-            return float(eval(expr, {"__builtins__": None}, {}))
+            return safe_eval_formula(self.expression, ch_values)
         except Exception:
+            logging.exception("Custom formula evaluation failed: %s", self.expression)
             return np.nan
 
 
@@ -277,19 +283,31 @@ class MappingWorker(QThread):
         self.map_layers = map_layers_ref
         self.exposure_time = exposure_time
         self.is_running = True
+        self._x_axis = np.array(main_window.spectrum_view.x_axis, copy=True)
+        self._virtual_channels = list(main_window.mapping_view.virtual_channels)
+        self._formulas = list(main_window.mapping_view.formulas)
+        self._use_hw_trigger = bool(main_window.control_panel.chk_hw_trigger.isChecked())
+        self._original_speed = float(main_window.control_panel.spin_speed.value())
+        try:
+            _laser_wl = float(main_window.control_panel.spin_laser.value())
+        except Exception:
+            _laser_wl = 532.0
+        self._temperature_pairs = snapshot_temperature_pairs(
+            main_window.control_panel.active_pairs, _laser_wl
+        )
 
     def run(self):
         cam = self.main_window.cam
         stage = self.main_window.stage
 
-        x_axis = self.main_window.spectrum_view.x_axis
-        active_pairs = self.main_window.control_panel.active_pairs
-        virtual_channels = self.main_window.mapping_view.virtual_channels
-        formulas = self.main_window.mapping_view.formulas
+        x_axis = self._x_axis
+        active_pairs = self._temperature_pairs
+        virtual_channels = self._virtual_channels
+        formulas = self._formulas
 
         map_type = self.params['map_type']
-        use_hw_trigger = self.main_window.control_panel.chk_hw_trigger.isChecked()
-        original_speed = self.main_window.control_panel.spin_speed.value()
+        use_hw_trigger = self._use_hw_trigger
+        original_speed = self._original_speed
 
         x_points = np.arange(self.params['x_start'], self.params['x_end'] + self.params['x_step'] / 2,
                              self.params['x_step'])
@@ -317,12 +335,18 @@ class MappingWorker(QThread):
             writer = csv.writer(f_csv)
             writer.writerow(['X(um)', 'Y(um)', 'Z(um)'] + list(x_axis))
 
+        camera_claimed = False
         try:
+            if cam.is_connected:
+                camera_claimed = cam.begin_exclusive_capture(
+                    "EXTERNAL" if use_hw_trigger else "INTERNAL",
+                    restart=use_hw_trigger,
+                )
+                if not camera_claimed:
+                    raise RuntimeError("다른 작업이 카메라를 사용 중입니다.")
+                if use_hw_trigger:
+                    cam.grab_frame(timeout_ms=20)
             if use_hw_trigger and cam.is_connected and stage.is_connected:
-                cam.stop_capture()
-                cam.set_trigger_mode("EXTERNAL")
-                cam.start_capture()
-                cam.grab_frame()
                 stage.set_trigger_out(axis=fast_ax, value='0.0')
                 time.sleep(0.1)
 
@@ -381,7 +405,7 @@ class MappingWorker(QThread):
                                 if temp_frame is not None and hasattr(temp_frame, 'ndim'): frame = temp_frame
                             else:
                                 timeout_limit = self.exposure_time + 2.0
-                                max_retries = int(timeout_limit / 0.015)
+                                max_retries = max(1, int(timeout_limit / 0.11))
                                 for _ in range(max_retries):
                                     temp_frame = cam.grab_frame()
                                     if temp_frame is not None and hasattr(temp_frame, 'ndim'):
@@ -420,7 +444,9 @@ class MappingWorker(QThread):
                                     shape_3d = (1, len(z_points), len(x_axis))
                                 else:
                                     shape_3d = (len(y_points), len(x_points), len(x_axis))
-                                self.map_layers["RAW_SPECTRA"] = np.full(shape_3d, np.nan)
+                                self.map_layers["RAW_SPECTRA"] = allocate_spectrum_cube(
+                                    shape_3d, dtype=np.float32
+                                )
                             self.map_layers["RAW_SPECTRA"][idx[0] if "Z 1D" not in map_type else 0,
                             idx[1] if "Z 1D" not in map_type else idx[1], :] = spectrum_1d
 
@@ -440,7 +466,7 @@ class MappingWorker(QThread):
                             for pair in active_pairs:
                                 layer_name = f"온도 (Pair {pair.pair_id})"
                                 if layer_name in self.map_layers:
-                                    t = pair.update_temperature(x_axis, processed_1d, is_mapping=True)
+                                    t = pair.calculate(x_axis, processed_1d)
                                     self.map_layers[layer_name][idx] = t if t is not None else np.nan
 
                             for ch in virtual_channels:
@@ -463,6 +489,8 @@ class MappingWorker(QThread):
                     if "Z 1D" not in map_type:
                         self.row_finished_signal.emit(yi)
 
+        except Exception:
+            logging.exception("MappingWorker failed")
         finally:
             if f_csv is not None: f_csv.close()
 
@@ -471,9 +499,8 @@ class MappingWorker(QThread):
                 if use_hw_trigger:
                     stage.set_trigger_out(axis=fast_ax, value='0')
 
-            if use_hw_trigger and cam.is_connected:
-                cam.stop_capture()
-                cam.set_trigger_mode("INTERNAL")
+            if cam.is_connected and camera_claimed:
+                cam.end_exclusive_capture(resume_live=True)
 
             if stage.is_connected and self.is_running:
                 print("[Mapping] 스캔 완료. 0점으로 복귀합니다.")
@@ -505,6 +532,14 @@ class HomoepiWorker(QThread):
         self.crop_dist = crop_dist
         self.ignore_dist = ignore_dist
         self.is_running = True
+        self._use_hw_trigger = bool(main_window.control_panel.chk_hw_trigger.isChecked())
+        self._original_speed = float(main_window.control_panel.spin_speed.value())
+        try:
+            self._exposure_time = float(main_window.control_panel.exposure_input.text())
+        except Exception:
+            self._exposure_time = 0.01
+        self._waves = np.array(main_window.spectrum_view.x_axis, copy=True)
+        self._dz_step = float(main_window.homoepi_view.sp_z_step.value())
 
     def run(self):
         try:
@@ -514,14 +549,11 @@ class HomoepiWorker(QThread):
             cam = self.main_window.cam
             stage = self.main_window.stage
 
-            use_hw_trigger = self.main_window.control_panel.chk_hw_trigger.isChecked()
-            original_speed = self.main_window.control_panel.spin_speed.value()
-            try:
-                exposure_time = float(self.main_window.control_panel.exposure_input.text())
-            except:
-                exposure_time = 0.01
+            use_hw_trigger = self._use_hw_trigger
+            original_speed = self._original_speed
+            exposure_time = self._exposure_time
 
-            self.waves = self.main_window.spectrum_view.x_axis
+            self.waves = self._waves
             if self.waves is None or len(self.waves) == 0:
                 raise ValueError("X축(Wavenumber) 데이터가 없습니다. 모니터링을 시작했는지 확인하세요.")
 
@@ -530,11 +562,17 @@ class HomoepiWorker(QThread):
             waves_intf = self.waves[mask_intf]
             z_forward = True
 
+            camera_claimed = False
+            if cam.is_connected:
+                camera_claimed = cam.begin_exclusive_capture(
+                    "EXTERNAL" if use_hw_trigger else "INTERNAL",
+                    restart=use_hw_trigger,
+                )
+                if not camera_claimed:
+                    raise RuntimeError("다른 작업이 카메라를 사용 중입니다.")
+                if use_hw_trigger:
+                    cam.grab_frame(timeout_ms=20)
             if use_hw_trigger and cam.is_connected and stage.is_connected:
-                cam.stop_capture()
-                cam.set_trigger_mode("EXTERNAL")
-                cam.start_capture()
-                cam.grab_frame()
                 stage.set_trigger_out(axis='z', value='0.0')
                 time.sleep(0.1)
 
@@ -552,7 +590,7 @@ class HomoepiWorker(QThread):
 
                     if use_hw_trigger and stage.is_connected:
                         stage.set_speed(original_speed)
-                        dz_step = self.main_window.homoepi_view.sp_z_step.value()
+                        dz_step = self._dz_step
                         prep_z = current_z_vals[0] - dz_step if is_forward_z else current_z_vals[0] + dz_step
 
                         stage.set_trigger_out(axis='z', value='0')
@@ -635,7 +673,11 @@ class HomoepiWorker(QThread):
                     except:
                         thickness = 0.0
 
-                    raw_data = {"z": z_arr, "spectra": spectra_arr, "waves": self.waves}
+                    raw_data = {
+                "z": z_arr.astype(np.float32, copy=False),
+                "spectra": spectra_arr.astype(np.float32, copy=False),
+                "waves": self.waves,
+            }
                     self.update_map.emit(x, y, thickness, raw_data)
 
                     current_point += 1
@@ -653,9 +695,8 @@ class HomoepiWorker(QThread):
                 stage.set_speed(original_speed)
                 if use_hw_trigger: stage.set_trigger_out(axis='z', value='0')
 
-            if use_hw_trigger and cam.is_connected:
-                cam.stop_capture()
-                cam.set_trigger_mode("INTERNAL")
+            if cam.is_connected and camera_claimed:
+                cam.end_exclusive_capture(resume_live=True)
 
             if stage.is_connected and self.is_running:
                 print("[Homoepi] 3D 스캔 완료. 0점으로 복귀합니다.")
@@ -824,6 +865,10 @@ class LiveViewWidget(QWidget):
         self.main_window = main_window
         self.cam = main_window.cam
         self.current_frame = None
+        self._frame_update_busy = False
+        self._levels_initialized = False
+        self._last_spectrum_update = 0.0
+        self._spectrum_update_period = 0.10
 
         layout = QVBoxLayout(self)
 
@@ -848,21 +893,39 @@ class LiveViewWidget(QWidget):
 
     def start_live(self):
         if self.cam.is_connected: self.cam.start_capture()
-        self.timer.start(50)
+        self.timer.start(100)
 
     def stop_live(self):
         self.timer.stop()
         if self.cam.is_connected: self.cam.stop_capture()
 
     def update_frame(self):
-        frame = self.cam.grab_frame() if self.cam.is_connected else None
-        if frame is None and not self.cam.is_connected:
-            frame = np.random.randint(0, 40, (480, 640), dtype=np.uint8)
-        if frame is not None:
+        if self._frame_update_busy:
+            return
+        self._frame_update_busy = True
+        try:
+            frame = (
+                self.cam.grab_frame(timeout_ms=25, nonblocking=True)
+                if self.cam.is_connected else None
+            )
+            if frame is None and not self.cam.is_connected:
+                frame = np.random.randint(0, 40, (480, 640), dtype=np.uint8)
+            if frame is None:
+                return
             self.current_frame = frame
-            self.img_item.setImage(frame, autoLevels=True)
-            spectrum_1d = np.sum(frame, axis=0)
-            self.main_window.spectrum_view.process_spectrum(spectrum_1d)
+            self.img_item.setImage(
+                frame, autoLevels=not self._levels_initialized
+            )
+            self._levels_initialized = True
+            now = time.monotonic()
+            if now - self._last_spectrum_update >= self._spectrum_update_period:
+                spectrum_1d = np.sum(frame, axis=0, dtype=np.float64)
+                self.main_window.spectrum_view.process_spectrum(spectrum_1d)
+                self._last_spectrum_update = now
+        except Exception:
+            logging.exception("LiveView frame update failed")
+        finally:
+            self._frame_update_busy = False
 
     def save_data(self):
         if self.current_frame is None: return
@@ -961,7 +1024,7 @@ class SpectrumViewWidget(QWidget):
 
     def process_spectrum(self, raw_1d: np.ndarray):
         target_frames = self.spin_accum.value()
-        self.rolling_buffer.append(raw_1d)
+        self.rolling_buffer.append(np.asarray(raw_1d, dtype=np.float32))
 
         while len(self.rolling_buffer) > target_frames: self.rolling_buffer.pop(0)
 
@@ -1413,7 +1476,7 @@ class MappingViewWidget(QWidget):
                     min_x = min(len(x_vals), current_data.shape[1])
                     df = pd.DataFrame(current_data[:min_y, :min_x], index=np.round(y_vals[:min_y], 3),
                                       columns=np.round(x_vals[:min_x], 3))
-                    df.index.name = "Y \ X"
+                    df.index.name = "Y \\ X"
                     df.to_csv(file_path, encoding='utf-8-sig')
             else:
                 pg.exporters.ImageExporter(self.plot_map.scene()).export(file_path)

@@ -1,0 +1,19 @@
+Hardware-free validation result
+Date: 2026-07-13
+
+PASS - Python syntax compilation for all patch modules
+PASS - AST-based formula evaluator
+PASS - float32 in-memory spectrum allocation
+PASS - disk-backed NumPy memmap allocation and flush
+PASS - piezo controller simulation/connect/move/stop/disconnect
+PASS - Raman ML model save/load/inference
+PASS - fake DCAM initialize/connect/capture/frame copy
+PASS - exclusive camera ownership blocks competing live-view access
+PASS - automatic main.py patcher synthetic compatibility test
+PASS - automatic patcher idempotency test
+
+Not tested here:
+- Physical Hamamatsu ORCA-Quest2 / DCAMAPI / CoaXPress acquisition
+- Physical piezo stage serial protocol and trigger timing
+- Long-duration mapping on the measurement PC
+- Vendor driver or firmware crashes
