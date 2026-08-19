@@ -60,6 +60,14 @@ def _empty_trace(reason: str, point_count: int) -> TraceMetrics:
         vertical_centroid_px=float("nan"),
         vertical_fwhm_px=float("nan"),
         vertical_clipping_margin_px=float("nan"),
+        spatial_valid_column_count=0,
+        spatial_sampled_columns=empty,
+        spatial_centers=empty,
+        spatial_fit_columns=empty,
+        spatial_fit_centers=empty,
+        spectrum_tilt_rows_per_100_columns=float("nan"),
+        spectrum_vertical_drift_px=float("nan"),
+        spectrum_center_residual_rms_px=float("nan"),
         rectified_projection=np.zeros(point_count, dtype=np.float64),
     )
 
@@ -71,6 +79,8 @@ def analyze_trace(
     peak_half_window_pixels: int,
     row_step: int = 4,
     minimum_row_snr: float = 4.0,
+    spatial_minimum_snr: float = 5.0,
+    spatial_signal_threshold: float = 0.0,
     minimum_valid_row_ratio: float = 0.15,
 ) -> TraceMetrics:
     frame = np.asarray(corrected_frame, dtype=np.float64)
@@ -190,6 +200,50 @@ def analyze_trace(
         vertical_fwhm = float("nan")
         vertical_margin = float("nan")
 
+    # For every detector column, take the y coordinate of its maximum intensity.
+    # Reject the complete column when that maximum does not meet the requested
+    # signal and SNR gates, then fit one straight line through all retained points.
+    column_indices = np.arange(width, dtype=int)
+    maximum_rows = np.argmax(frame, axis=0)
+    maximum_values = frame[maximum_rows, column_indices]
+    noise_stride = max(1, (height - 1) // 64)
+    baseline_samples = frame[::noise_stride]
+    column_baseline = np.percentile(baseline_samples, 10.0, axis=0)
+    peak_signals = maximum_values - column_baseline
+    noise_rows = np.arange(0, height - 1, noise_stride, dtype=int)
+    differences = frame[noise_rows + 1] - frame[noise_rows]
+    difference_median = np.median(differences, axis=0)
+    column_noise = 1.4826 * np.median(
+        np.abs(differences - difference_median[None, :]), axis=0
+    ) / np.sqrt(2.0)
+    column_snr = np.divide(
+        peak_signals,
+        column_noise,
+        out=np.full(width, np.inf, dtype=np.float64),
+        where=column_noise > 1e-12,
+    )
+    keep_columns = (
+        (peak_signals > max(0.0, float(spatial_signal_threshold)))
+        & (column_snr >= float(spatial_minimum_snr))
+        & ~np.any(saturated, axis=0)
+    )
+    spatial_x = column_indices[keep_columns].astype(np.float64)
+    spatial_y = maximum_rows[keep_columns].astype(np.float64)
+    spatial_fit_x = np.empty(0, dtype=np.float64)
+    spatial_fit_y = np.empty(0, dtype=np.float64)
+    if spatial_x.size >= 2 and float(np.ptp(spatial_x)) > 0:
+        spatial_linear = np.polyfit(spatial_x, spatial_y, 1)
+        spatial_residual = spatial_y - np.polyval(spatial_linear, spatial_x)
+        spatial_fit_x = np.asarray([0.0, float(width - 1)], dtype=np.float64)
+        spatial_fit_y = np.polyval(spatial_linear, spatial_fit_x)
+        spectrum_tilt = float(spatial_linear[0] * 100.0)
+        spectrum_vertical_drift = float(abs(spatial_linear[0]) * max(width - 1, 0))
+        spectrum_center_residual = float(np.sqrt(np.mean(spatial_residual**2)))
+    else:
+        spectrum_tilt = float("nan")
+        spectrum_vertical_drift = float("nan")
+        spectrum_center_residual = float("nan")
+
     valid = valid_row_ratio >= minimum_valid_row_ratio
     reason = "" if valid else f"Valid-row ratio {valid_row_ratio:.2f} is too low"
     return TraceMetrics(
@@ -212,6 +266,14 @@ def analyze_trace(
         vertical_centroid_px=vertical_centroid,
         vertical_fwhm_px=float(vertical_fwhm),
         vertical_clipping_margin_px=vertical_margin,
+        spatial_valid_column_count=int(spatial_x.size),
+        spatial_sampled_columns=spatial_x,
+        spatial_centers=spatial_y,
+        spatial_fit_columns=spatial_fit_x,
+        spatial_fit_centers=spatial_fit_y,
+        spectrum_tilt_rows_per_100_columns=spectrum_tilt,
+        spectrum_vertical_drift_px=spectrum_vertical_drift,
+        spectrum_center_residual_rms_px=spectrum_center_residual,
         rectified_projection=rectified_projection,
     )
 

@@ -33,6 +33,11 @@ def result_metric_values(result: AlignmentResult) -> dict[str, float]:
         "Projection broadening": result.trace.projection_broadening,
         "Row FWHM CV": result.trace.row_fwhm_cv,
         "Valid-row ratio": result.trace.valid_row_ratio,
+        "Vertical centroid (px)": result.trace.vertical_centroid_px,
+        "Vertical clipping margin (px)": result.trace.vertical_clipping_margin_px,
+        "Valid column count": float(result.trace.spatial_valid_column_count),
+        "Spectrum tilt (rows/100 columns)": result.trace.spectrum_tilt_rows_per_100_columns,
+        "Spectrum vertical drift (px)": result.trace.spectrum_vertical_drift_px,
     }
 
 

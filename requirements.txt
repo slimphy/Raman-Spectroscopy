@@ -3,6 +3,7 @@ pyqtgraph
 numpy
 scipy
 pyserial
+imagingcontrol4>=1.5.3.3316
 torch
 torchvision
 torchaudio

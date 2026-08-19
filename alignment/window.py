@@ -164,12 +164,23 @@ class AlignmentWindow(QMainWindow):
         self.row_step = QSpinBox()
         self.row_step.setRange(1, 64)
         self.row_step.setValue(4)
+        self.spatial_minimum_snr = _spinbox(1.0, 100.0, 5.0, 1)
+        self.spatial_minimum_snr.setToolTip(
+            "A detector column is used only when its vertical maximum exceeds this SNR."
+        )
+        self.spatial_signal_threshold = _spinbox(0.0, 1_000_000.0, 0.0, 1)
+        self.spatial_signal_threshold.setSpecialValueText("SNR only")
+        self.spatial_signal_threshold.setToolTip(
+            "Optional minimum background-subtracted maximum intensity for each column."
+        )
         self.btn_auto_peak = QPushButton("Find strongest peak")
         reference_layout.addRow(self.reference_label)
         reference_layout.addRow("Peak center (px)", self.peak_center)
         reference_layout.addRow("Half window (px)", self.peak_half_window)
         reference_layout.addRow("Raman shift / pixel", self.cm_per_pixel)
-        reference_layout.addRow("Analyze every Nth row", self.row_step)
+        reference_layout.addRow("Sample every Nth row/column", self.row_step)
+        reference_layout.addRow("Column maximum minimum SNR", self.spatial_minimum_snr)
+        reference_layout.addRow("Column signal threshold", self.spatial_signal_threshold)
         reference_layout.addRow(self.btn_auto_peak)
         layout.addWidget(reference_group)
 
@@ -225,9 +236,19 @@ class AlignmentWindow(QMainWindow):
         self.image_plot.invertY(True)
         self.image_item = pg.ImageItem()
         self.image_plot.addItem(self.image_item)
+        self.image_plot.addLegend()
         self.trace_curve = self.image_plot.plot(
-            pen=pg.mkPen("#00e5ff", width=2), symbol="o", symbolSize=3, symbolBrush="#00e5ff"
+            pen=pg.mkPen("#00e5ff", width=2), symbol="o", symbolSize=3,
+            symbolBrush="#00e5ff", name="Peak trace x(y)"
         )
+        self.spatial_trace_curve = self.image_plot.plot(
+            pen=pg.mkPen("#ff4081", width=2), name="Peak-center alignment line"
+        )
+        self.alignment_peak_scatter = pg.ScatterPlotItem(
+            pen=pg.mkPen("#ffffff", width=1), brush=pg.mkBrush("#ff1744"), size=9,
+            name="Accepted column maxima"
+        )
+        self.image_plot.addItem(self.alignment_peak_scatter)
         self.saturation_scatter = pg.ScatterPlotItem(
             pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 80, 180), size=4
         )
@@ -281,6 +302,9 @@ class AlignmentWindow(QMainWindow):
             "D2 amplitude balance", "D2 position balance", "D2 area balance",
             "Trace tilt", "Trace center drift", "Trace curvature RMS", "Row FWHM",
             "Row FWHM CV", "Projection broadening", "Valid-row ratio",
+            "Vertical center", "Vertical FWHM", "Vertical edge margin",
+            "Spectrum horizontal tilt", "Spectrum vertical drift", "Spatial fit RMS",
+            "Valid column count",
             "Center jitter", "FWHM stability CV", "Area stability CV", "Analysis latency",
         ]
         for index, name in enumerate(metric_names):
@@ -302,6 +326,8 @@ class AlignmentWindow(QMainWindow):
                 "Peak FWHM (px)", "Width symmetry", "D2 amplitude balance",
                 "Trace tilt (px/100 rows)", "Trace curvature RMS (px)",
                 "Projection broadening", "Peak area", "Peak SNR",
+                "Vertical centroid (px)", "Vertical clipping margin (px)",
+                "Spectrum tilt (rows/100 columns)", "Spectrum vertical drift (px)",
             ]
         )
         self.trend_plot = pg.PlotWidget()
@@ -331,6 +357,8 @@ class AlignmentWindow(QMainWindow):
         self.peak_half_window.valueChanged.connect(self._settings_changed)
         self.cm_per_pixel.valueChanged.connect(self._settings_changed)
         self.row_step.valueChanged.connect(self._settings_changed)
+        self.spatial_minimum_snr.valueChanged.connect(self._settings_changed)
+        self.spatial_signal_threshold.valueChanged.connect(self._settings_changed)
         self.output_bits.currentTextChanged.connect(self._settings_changed)
         self.peak_region.sigRegionChangeFinished.connect(self._region_changed)
         self.trend_metric.currentTextChanged.connect(self._update_trend)
@@ -347,6 +375,8 @@ class AlignmentWindow(QMainWindow):
             saturation_level=0.98,
             minimum_peak_snr=5.0,
             minimum_row_snr=4.0,
+            spatial_minimum_snr=float(self.spatial_minimum_snr.value()),
+            spatial_signal_threshold=float(self.spatial_signal_threshold.value()),
             minimum_valid_row_ratio=0.15,
             row_step=int(self.row_step.value()),
             reference_raman_shift_cm1=self.profile.reference_raman_shift_cm1,
@@ -503,6 +533,12 @@ class AlignmentWindow(QMainWindow):
                 high = low + 1.0
             self.image_item.setImage(result.corrected_frame, autoLevels=False, levels=(low, high))
         self.trace_curve.setData(result.trace.centers, result.trace.sampled_rows)
+        self.spatial_trace_curve.setData(
+            result.trace.spatial_fit_columns, result.trace.spatial_fit_centers
+        )
+        self.alignment_peak_scatter.setData(
+            result.trace.spatial_sampled_columns, result.trace.spatial_centers
+        )
 
         threshold = result.quality.sensor_maximum * self._current_config().saturation_level
         oriented_raw = raw_frame if self._current_config().dispersion_axis == 1 else raw_frame.T
@@ -563,6 +599,15 @@ class AlignmentWindow(QMainWindow):
             "Row FWHM CV": _format(100.0 * result.trace.row_fwhm_cv, 2, " %"),
             "Projection broadening": _format(100.0 * result.trace.projection_broadening, 2, " %"),
             "Valid-row ratio": _format(100.0 * result.trace.valid_row_ratio, 1, " %"),
+            "Vertical center": _format(result.trace.vertical_centroid_px, 2, " px"),
+            "Vertical FWHM": _format(result.trace.vertical_fwhm_px, 2, " px"),
+            "Vertical edge margin": _format(result.trace.vertical_clipping_margin_px, 1, " px"),
+            "Spectrum horizontal tilt": _format(
+                result.trace.spectrum_tilt_rows_per_100_columns, 4, " rows/100 cols"
+            ),
+            "Spectrum vertical drift": _format(result.trace.spectrum_vertical_drift_px, 3, " px"),
+            "Spatial fit RMS": _format(result.trace.spectrum_center_residual_rms_px, 3, " px"),
+            "Valid column count": str(result.trace.spatial_valid_column_count),
             "Center jitter": _format(stability.center_jitter_rms_px, 4, " px"),
             "FWHM stability CV": _format(100.0 * stability.fwhm_cv, 2, " %"),
             "Area stability CV": _format(100.0 * stability.area_cv, 2, " %"),

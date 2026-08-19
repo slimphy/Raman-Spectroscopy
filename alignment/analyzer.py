@@ -23,6 +23,8 @@ class AlignmentConfig:
     saturation_level: float = 0.98
     minimum_peak_snr: float = 5.0
     minimum_row_snr: float = 4.0
+    spatial_minimum_snr: float = 5.0
+    spatial_signal_threshold: float = 0.0
     minimum_valid_row_ratio: float = 0.15
     row_step: int = 4
     reference_raman_shift_cm1: float = 520.0
@@ -77,6 +79,8 @@ def analyze_alignment_frame(
         peak_half_window_pixels=config.peak_half_window_pixels,
         row_step=config.row_step,
         minimum_row_snr=config.minimum_row_snr,
+        spatial_minimum_snr=config.spatial_minimum_snr,
+        spatial_signal_threshold=config.spatial_signal_threshold,
         minimum_valid_row_ratio=config.minimum_valid_row_ratio,
     )
     x_axis = np.arange(raw_projection.size, dtype=np.float64)

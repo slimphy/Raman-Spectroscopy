@@ -64,6 +64,14 @@ class TraceMetrics:
     vertical_centroid_px: float
     vertical_fwhm_px: float
     vertical_clipping_margin_px: float
+    spatial_valid_column_count: int
+    spatial_sampled_columns: np.ndarray
+    spatial_centers: np.ndarray
+    spatial_fit_columns: np.ndarray
+    spatial_fit_centers: np.ndarray
+    spectrum_tilt_rows_per_100_columns: float
+    spectrum_vertical_drift_px: float
+    spectrum_center_residual_rms_px: float
     rectified_projection: np.ndarray
 
 

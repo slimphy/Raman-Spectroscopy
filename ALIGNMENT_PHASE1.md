@@ -33,6 +33,8 @@ capture.
 2. Block the optical input and capture the 20-frame dark average.
 3. Unblock the Si signal and start with fixed image levels. Auto levels are for exploration only.
 4. Press **Find strongest peak**, then resize the yellow ROI around the Si 520 cm⁻¹ line.
+   Set **Column maximum minimum SNR** to control which per-column maximum points are used for
+   the magenta straight-line fit. **Column signal threshold** provides an optional intensity gate.
 5. Adjust qCMOS, cylindrical optics, and grating while watching:
    - trace tilt and center drift;
    - trace curvature and row FWHM;
@@ -54,6 +56,7 @@ after changing the camera ROI or binning.
 - saturation fraction and detector headroom;
 - peak SNR and valid-row ratio;
 - vertical clipping margin.
+- horizontal-spectrum tilt and total vertical drift for minimizing the vertical ROI.
 
 ### 2D geometry
 

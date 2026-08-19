@@ -47,6 +47,17 @@ def config(center: float = 250.0) -> AlignmentConfig:
     )
 
 
+def config_with_spatial_settings(*, minimum_snr: float = 5.0, threshold: float = 0.0) -> AlignmentConfig:
+    base = config()
+    return AlignmentConfig(
+        **{
+            **base.to_dict(),
+            "spatial_minimum_snr": minimum_snr,
+            "spatial_signal_threshold": threshold,
+        }
+    )
+
+
 def test_symmetric_peak_and_trace_report_high_symmetry() -> None:
     result = analyze_alignment_frame(synthetic_frame(), None, config())
     assert result.peak.valid
@@ -58,6 +69,49 @@ def test_symmetric_peak_and_trace_report_high_symmetry() -> None:
     assert result.peak.derivative_amplitude_balance > 0.92
     assert abs(result.trace.trace_tilt_px_per_100_rows) < 0.05
     assert result.trace.trace_curvature_rms_px < 0.05
+
+
+def spatial_spectrum_frame(tilt_total_rows: float = 0.0, noise: float = 0.0) -> np.ndarray:
+    height, width = 160, 512
+    y = np.arange(height, dtype=np.float64)
+    x = np.arange(width, dtype=np.float64)
+    centers_y = 80.0 + tilt_total_rows * (x - 0.5 * (width - 1)) / (width - 1)
+    spatial = np.exp(-0.5 * ((y[:, None] - centers_y[None, :]) / 10.0) ** 2)
+    spectrum = np.full(width, 40.0, dtype=np.float64)
+    for peak_center, amplitude in ((70, 500), (155, 650), (250, 900), (350, 700), (445, 550)):
+        spectrum += amplitude * np.exp(-0.5 * ((x - peak_center) / 4.0) ** 2)
+    frame = 200.0 + spatial * spectrum[None, :]
+    if noise > 0:
+        frame += np.random.default_rng(321).normal(0.0, noise, frame.shape)
+    return frame.astype(np.float32)
+
+
+def test_horizontal_spectrum_tilt_reports_vertical_roi_drift() -> None:
+    level = analyze_alignment_frame(spatial_spectrum_frame(), None, config())
+    tilted = analyze_alignment_frame(spatial_spectrum_frame(20.0), None, config())
+    assert abs(level.trace.spectrum_tilt_rows_per_100_columns) < 0.02
+    assert level.trace.spectrum_vertical_drift_px < 0.1
+    assert abs(tilted.trace.spectrum_tilt_rows_per_100_columns) > 3.5
+    assert 18.0 < tilted.trace.spectrum_vertical_drift_px < 21.0
+    assert level.trace.spatial_valid_column_count == 512
+    assert tilted.trace.spatial_valid_column_count == 512
+
+
+def test_column_signal_threshold_rejects_weak_columns() -> None:
+    frame = spatial_spectrum_frame()
+    accepted = analyze_alignment_frame(frame, None, config_with_spatial_settings(threshold=10.0))
+    rejected = analyze_alignment_frame(frame, None, config_with_spatial_settings(threshold=1e6))
+    assert accepted.trace.spatial_valid_column_count == 512
+    assert rejected.trace.spatial_valid_column_count == 0
+    assert not np.isfinite(rejected.trace.spectrum_tilt_rows_per_100_columns)
+
+
+def test_column_snr_gate_excludes_low_snr_maxima() -> None:
+    frame = spatial_spectrum_frame(noise=2.0)
+    accepted = analyze_alignment_frame(frame, None, config_with_spatial_settings(minimum_snr=5.0))
+    rejected = analyze_alignment_frame(frame, None, config_with_spatial_settings(minimum_snr=1e6))
+    assert accepted.trace.spatial_valid_column_count > 400
+    assert rejected.trace.spatial_valid_column_count == 0
 
 
 def test_trace_tilt_increases_drift_and_projection_broadening() -> None:

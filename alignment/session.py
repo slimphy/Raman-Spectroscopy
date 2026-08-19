@@ -71,6 +71,8 @@ class AlignmentSession:
                     "trace_residual_rms_px", "median_row_fwhm_px", "row_fwhm_cv",
                     "row_area_cv", "projection_broadening", "vertical_centroid_px",
                     "vertical_fwhm_px", "vertical_clipping_margin_px",
+                    "spatial_valid_column_count", "spectrum_tilt_rows_per_100_columns",
+                    "spectrum_vertical_drift_px", "spectrum_center_residual_rms_px",
                 )
             },
         }
