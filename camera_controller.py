@@ -1,4 +1,3 @@
-import numpy as np
 import time
 
 try:
@@ -6,9 +5,9 @@ try:
     from dcamcon import *
 
     DCAM_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     DCAM_AVAILABLE = False
-    print("⚠️ [Error] dcam.py 또는 dcamcon.py 파일을 찾을 수 없습니다.")
+    print("[Camera] DCAM Python module or dcamapi.dll is unavailable. Simulation can still run.")
 
 
 class CameraController:

@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "unit": "um",
+  "profiles": {
+    "20X": {
+      "um_per_pixel": 0.13769098152546297,
+      "sample_count": 11,
+      "samples": [
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 141.54309241650242,
+          "um_per_pixel": 0.14129972475907424
+        },
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 153.25567402154698,
+          "um_per_pixel": 0.130500877880633
+        },
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 153.25567402154698,
+          "um_per_pixel": 0.130500877880633
+        },
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 144.11905242456683,
+          "um_per_pixel": 0.13877415694547515
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 119.21022694931149,
+          "um_per_pixel": 0.13421667259138131
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 112.70152426433441,
+          "um_per_pixel": 0.14196791129881256
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 112.66346870888029,
+          "um_per_pixel": 0.1420158653320325
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 117.93722602192216,
+          "um_per_pixel": 0.1356653920029111
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 116.59150110623645,
+          "um_per_pixel": 0.1372312719897228
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 112.66346870888029,
+          "um_per_pixel": 0.1420158653320325
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 113.95022791154136,
+          "um_per_pixel": 0.14041218076738443
+        }
+      ],
+      "updated_at": "2026-08-19T15:11:46+09:00"
+    },
+    "100X": {
+      "um_per_pixel": 0.02818729558453646,
+      "sample_count": 8,
+      "samples": [
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 566.452538702726,
+          "um_per_pixel": 0.02824596750266626
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 570.098754817732,
+          "um_per_pixel": 0.028065313008998605
+        },
+        {
+          "known_length_um": 16.0,
+          "pixel_length": 568.7899556645662,
+          "um_per_pixel": 0.028129891958633177
+        },
+        {
+          "known_length_um": 8.0,
+          "pixel_length": 285.8118250756052,
+          "um_per_pixel": 0.02799044440475399
+        },
+        {
+          "known_length_um": 8.0,
+          "pixel_length": 284.4462394586759,
+          "um_per_pixel": 0.02812482251558201
+        },
+        {
+          "known_length_um": 8.0,
+          "pixel_length": 281.9508362680282,
+          "um_per_pixel": 0.0283737409893512
+        },
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 707.8172494524661,
+          "um_per_pixel": 0.028255881041993614
+        },
+        {
+          "known_length_um": 20.0,
+          "pixel_length": 706.4066748774105,
+          "um_per_pixel": 0.028312303254312807
+        }
+      ],
+      "updated_at": "2026-08-19T15:11:46+09:00"
+    }
+  }
+}

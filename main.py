@@ -19,7 +19,28 @@ import csv
 
 # 커스텀 모듈
 from camera_controller import CameraController
+from mapping_correction import (
+    ROW_SHIFT_BOTH,
+    ROW_SHIFT_EVEN_RIGHT,
+    ROW_SHIFT_ODD_LEFT,
+    apply_alternating_row_shift,
+    shifted_display_x_to_source_x,
+)
+from mapping_storage import mapping_result_path, mapping_results_dir
 from stage_controller import PiezoController
+from vision_hardware_test import ImageCanvas
+from vision_test_support import (
+    CSN_POSITION_TO_OBJECTIVE,
+    OBJECTIVE_TO_CSN_POSITION,
+    CSN210Worker,
+    CalibrationStore,
+    CameraWorker as VisionCameraWorker,
+    IC4Runtime,
+    csn210_vendor_app_running,
+    objective_stage_delta_um,
+    roi_to_mapping_ranges,
+    translate_mapping_xy_bounds,
+)
 from raman_math import remove_als_baseline, calculate_temperature, apply_gaussian_1d, calibrate_raman_axis_quadratic
 from raman_ml import RamanMLProcessor
 import pandas as pd
@@ -313,11 +334,27 @@ class MappingWorker(QThread):
         writer = None
 
         if save_full:
-            f_csv = open(f"Raw_Hyperspectral_Data_{time.strftime('%Y%m%d_%H%M%S')}.csv", 'w', newline='')
+            raw_path = mapping_result_path(
+                f"Raw_Hyperspectral_Data_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            f_csv = open(raw_path, 'w', newline='')
             writer = csv.writer(f_csv)
             writer.writerow(['X(um)', 'Y(um)', 'Z(um)'] + list(x_axis))
 
         try:
+            # Allocate the full spectrum cube before arming the hardware trigger.
+            # For a 201 x 201 x 4096 map this initializes about 1.23 GiB, so doing
+            # it after the first frame would let the fly scan outrun acquisition.
+            # Keep float64 to preserve the existing saved-data precision.
+            if save_full and "RAW_SPECTRA" not in self.map_layers:
+                if "Z 1D" in map_type:
+                    shape_3d = (1, len(z_points), len(x_axis))
+                else:
+                    shape_3d = (len(y_points), len(x_points), len(x_axis))
+                self.map_layers["RAW_SPECTRA"] = np.full(
+                    shape_3d, np.nan, dtype=np.float64
+                )
+
             if use_hw_trigger and cam.is_connected and stage.is_connected:
                 cam.stop_capture()
                 cam.set_trigger_mode("EXTERNAL")
@@ -394,6 +431,7 @@ class MappingWorker(QThread):
 
                         spectrum_1d = np.full(len(x_axis), np.nan)
                         if frame is not None and hasattr(frame, 'ndim'):
+                            frame = self.main_window.subtract_dark(frame)
                             if frame.ndim == 2:
                                 raw_1d = np.sum(frame, axis=0)
                             else:
@@ -415,12 +453,6 @@ class MappingWorker(QThread):
                         idx = (0, zi) if "Z 1D" in map_type else (yi, xi)
 
                         if save_full:
-                            if "RAW_SPECTRA" not in self.map_layers:
-                                if "Z 1D" in map_type:
-                                    shape_3d = (1, len(z_points), len(x_axis))
-                                else:
-                                    shape_3d = (len(y_points), len(x_points), len(x_axis))
-                                self.map_layers["RAW_SPECTRA"] = np.full(shape_3d, np.nan)
                             self.map_layers["RAW_SPECTRA"][idx[0] if "Z 1D" not in map_type else 0,
                             idx[1] if "Z 1D" not in map_type else idx[1], :] = spectrum_1d
 
@@ -588,6 +620,7 @@ class HomoepiWorker(QThread):
                             frame = np.random.randint(0, 40, (480, 640), dtype=np.uint8)
 
                         if frame is not None:
+                            frame = self.main_window.subtract_dark(frame)
                             raw_spectrum = np.sum(frame, axis=0)
                         else:
                             raw_spectrum = np.zeros_like(self.waves)
@@ -859,9 +892,10 @@ class LiveViewWidget(QWidget):
         if frame is None and not self.cam.is_connected:
             frame = np.random.randint(0, 40, (480, 640), dtype=np.uint8)
         if frame is not None:
-            self.current_frame = frame
-            self.img_item.setImage(frame, autoLevels=True)
-            spectrum_1d = np.sum(frame, axis=0)
+            corrected_frame = self.main_window.process_live_frame(frame)
+            self.current_frame = corrected_frame
+            self.img_item.setImage(corrected_frame, autoLevels=True)
+            spectrum_1d = np.sum(corrected_frame, axis=0)
             self.main_window.spectrum_view.process_spectrum(spectrum_1d)
 
     def save_data(self):
@@ -900,7 +934,7 @@ class SpectrumViewWidget(QWidget):
 
         self.spin_accum = QSpinBox()
         self.spin_accum.setRange(1, 100);
-        self.spin_accum.setValue(10)
+        self.spin_accum.setValue(1)
 
         top_bar.addWidget(self.chk_filter);
         top_bar.addWidget(self.chk_ml);
@@ -1044,9 +1078,11 @@ class MappingViewWidget(QWidget):
 
         self.x_start = QDoubleSpinBox();
         self.x_start.setRange(-10000, 10000);
+        self.x_start.setDecimals(3);
         self.x_start.setValue(0.0)
         self.x_end = QDoubleSpinBox();
         self.x_end.setRange(-10000, 10000);
+        self.x_end.setDecimals(3);
         self.x_end.setValue(10.0)
         self.x_step = QDoubleSpinBox();
         self.x_step.setRange(0.01, 1000);
@@ -1054,9 +1090,11 @@ class MappingViewWidget(QWidget):
 
         self.y_start = QDoubleSpinBox();
         self.y_start.setRange(-10000, 10000);
+        self.y_start.setDecimals(3);
         self.y_start.setValue(0.0)
         self.y_end = QDoubleSpinBox();
         self.y_end.setRange(-10000, 10000);
+        self.y_end.setDecimals(3);
         self.y_end.setValue(10.0)
         self.y_step = QDoubleSpinBox();
         self.y_step.setRange(0.01, 1000);
@@ -1142,6 +1180,22 @@ class MappingViewWidget(QWidget):
         self.combo_display_target.setStyleSheet("color: #00e5ff; font-weight: bold; background-color: #2b2b2b;")
         self.combo_display_target.currentIndexChanged.connect(self.refresh_mapping_display)
         view_select_layout.addWidget(self.combo_display_target, 1)
+        self.chk_row_shift_correction = QCheckBox("교대 행 X 보정")
+        self.chk_row_shift_correction.setChecked(False)
+        self.chk_row_shift_correction.setToolTip(
+            "원본 map 배열은 유지하고 화면 표시, 클릭 좌표, 현재 표시 데이터 CSV 저장에 보정을 적용합니다."
+        )
+        self.chk_row_shift_correction.stateChanged.connect(self.refresh_mapping_display)
+        view_select_layout.addWidget(self.chk_row_shift_correction)
+        self.combo_row_shift_mode = QComboBox()
+        self.combo_row_shift_mode.addItem("홀수 -1 / 짝수 +1", ROW_SHIFT_BOTH)
+        self.combo_row_shift_mode.addItem("홀수 행만 -1칸", ROW_SHIFT_ODD_LEFT)
+        self.combo_row_shift_mode.addItem("짝수 행만 +1칸", ROW_SHIFT_EVEN_RIGHT)
+        self.combo_row_shift_mode.setToolTip("행 번호는 1부터 계산합니다: 1, 3, 5행은 홀수 행입니다.")
+        self.combo_row_shift_mode.currentIndexChanged.connect(self.refresh_mapping_display)
+        self.chk_row_shift_correction.toggled.connect(self.combo_row_shift_mode.setEnabled)
+        self.combo_row_shift_mode.setEnabled(False)
+        view_select_layout.addWidget(self.combo_row_shift_mode)
         map_layout.addLayout(view_select_layout)
 
         pg.setConfigOptions(imageAxisOrder='row-major')
@@ -1218,14 +1272,27 @@ class MappingViewWidget(QWidget):
         pos = self.img_item.mapFromScene(event.scenePos())
         x_idx, y_idx = int(pos.x()), int(pos.y())
 
+        source_x_idx = x_idx
+        if self.chk_row_shift_correction.isChecked() and y_idx >= 0:
+            source_x_idx = shifted_display_x_to_source_x(
+                x_idx,
+                y_idx,
+                self.combo_row_shift_mode.currentData(),
+            )
+
         if "RAW_SPECTRA" in self.map_layers:
             raw_data = self.map_layers["RAW_SPECTRA"]
-            if 0 <= y_idx < raw_data.shape[0] and 0 <= x_idx < raw_data.shape[1]:
-                spec = raw_data[y_idx, x_idx, :]
+            if 0 <= y_idx < raw_data.shape[0] and 0 <= source_x_idx < raw_data.shape[1]:
+                spec = raw_data[y_idx, source_x_idx, :]
                 if not np.all(np.isnan(spec)):
                     x_axis = self.main_window.spectrum_view.x_axis
                     self.spec_curve.setData(x=x_axis, y=spec)
-                    self.plot_spec.setTitle(f"Point Spectrum (X: {x_idx}, Y: {y_idx})")
+                    if source_x_idx != x_idx:
+                        self.plot_spec.setTitle(
+                            f"Point Spectrum (Map X: {x_idx}, Source X: {source_x_idx}, Y: {y_idx})"
+                        )
+                    else:
+                        self.plot_spec.setTitle(f"Point Spectrum (X: {x_idx}, Y: {y_idx})")
         else:
             self.plot_spec.setTitle("※ RAW 저장 체크 해제됨 (스펙트럼 정보 없음)")
             self.spec_curve.setData([], [])
@@ -1344,7 +1411,8 @@ class MappingViewWidget(QWidget):
         if not target_key or target_key not in self.map_layers: return
 
         selected_data = self.map_layers[target_key]
-        valid_data = selected_data[~np.isnan(selected_data)]
+        display_data = self.apply_row_shift_correction(selected_data)
+        valid_data = display_data[~np.isnan(display_data)]
 
         if selected_data.shape[0] == 1:
             self.img_item.hide();
@@ -1354,8 +1422,8 @@ class MappingViewWidget(QWidget):
             z_start = self.z_start.value();
             z_step = self.z_step.value()
             z_axis = np.arange(selected_data.shape[1]) * z_step + z_start
-            mask = ~np.isnan(selected_data[0, :])
-            if np.any(mask): self.line_item.setData(x=z_axis[mask], y=selected_data[0, mask])
+            mask = ~np.isnan(display_data[0, :])
+            if np.any(mask): self.line_item.setData(x=z_axis[mask], y=display_data[0, mask])
         else:
             self.line_item.hide();
             self.img_item.show();
@@ -1364,9 +1432,15 @@ class MappingViewWidget(QWidget):
             if len(valid_data) > 0:
                 v_min, v_max = valid_data.min(), valid_data.max()
                 if v_min == v_max: v_max += 0.1
-                self.img_item.setImage(selected_data, autoLevels=False, levels=(v_min, v_max))
+                self.img_item.setImage(display_data, autoLevels=False, levels=(v_min, v_max))
             else:
-                self.img_item.setImage(selected_data, autoLevels=False, levels=(0, 1))
+                self.img_item.setImage(display_data, autoLevels=False, levels=(0, 1))
+
+    def apply_row_shift_correction(self, data):
+        """Return a display copy with the selected alternating-row X correction."""
+        if not self.chk_row_shift_correction.isChecked() or data.ndim != 2 or data.shape[0] <= 1:
+            return data
+        return apply_alternating_row_shift(data, self.combo_row_shift_mode.currentData())
 
     def update_mapping_progress(self, current_pt):
         self.progress_bar.setValue(current_pt)
@@ -1394,12 +1468,22 @@ class MappingViewWidget(QWidget):
         target_key = self.combo_display_target.currentText()
         if not target_key or target_key not in self.map_layers: return
 
-        current_data = self.map_layers[target_key]
+        current_data = self.apply_row_shift_correction(self.map_layers[target_key])
 
-        file_path, _ = QFileDialog.getSaveFileName(self, f"Save [{target_key}] Result", "",
-                                                   "CSV Files (*.csv);;PNG Image (*.png)")
-        if file_path:
-            if file_path.endswith('.csv'):
+        result_dir = mapping_results_dir()
+        default_path = result_dir / f"Mapping_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        selected_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            f"Save [{target_key}] Result",
+            str(default_path),
+            "CSV Files (*.csv);;PNG Image (*.png)",
+        )
+        if selected_path:
+            selected_name = os.path.basename(selected_path)
+            if not os.path.splitext(selected_name)[1]:
+                selected_name += ".csv" if selected_filter.startswith("CSV") else ".png"
+            file_path = mapping_result_path(selected_name)
+            if file_path.suffix.lower() == '.csv':
                 if current_data.shape[0] == 1:
                     z_vals = np.arange(current_data.shape[1]) * self.z_step.value() + self.z_start.value()
                     pd.DataFrame({"Z (um)": z_vals, "Value": current_data[0, :]}).to_csv(file_path, index=False,
@@ -1413,10 +1497,11 @@ class MappingViewWidget(QWidget):
                     min_x = min(len(x_vals), current_data.shape[1])
                     df = pd.DataFrame(current_data[:min_y, :min_x], index=np.round(y_vals[:min_y], 3),
                                       columns=np.round(x_vals[:min_x], 3))
-                    df.index.name = "Y \ X"
+                    df.index.name = "Y \\ X"
                     df.to_csv(file_path, encoding='utf-8-sig')
             else:
-                pg.exporters.ImageExporter(self.plot_map.scene()).export(file_path)
+                pg.exporters.ImageExporter(self.plot_map.scene()).export(str(file_path))
+            self.main_window.statusBar().showMessage(f"Mapping result saved: {file_path}", 8000)
 
 
 class HomoepiViewWidget(QWidget):
@@ -2052,6 +2137,21 @@ class ControlPanelWidget(QWidget):
         self.btn_apply_cam.clicked.connect(self.apply_camera_settings)
         cam_layout.addRow(self.btn_apply_cam)
 
+        dark_buttons = QHBoxLayout()
+        self.btn_capture_dark = QPushButton("Capture 20-frame dark")
+        self.btn_capture_dark.setStyleSheet(
+            "background-color: #455A64; color: white; font-weight: bold;"
+        )
+        self.btn_capture_dark.clicked.connect(self.main_window.start_dark_capture)
+        self.btn_clear_dark = QPushButton("Clear dark")
+        self.btn_clear_dark.clicked.connect(self.main_window.clear_dark_reference)
+        dark_buttons.addWidget(self.btn_capture_dark)
+        dark_buttons.addWidget(self.btn_clear_dark)
+        self.lbl_dark_status = QLabel("Dark: none")
+        self.lbl_dark_status.setStyleSheet("color: #90A4AE; font-weight: bold;")
+        cam_layout.addRow("Dark correction:", dark_buttons)
+        cam_layout.addRow(self.lbl_dark_status)
+
         self.chk_hw_trigger = QCheckBox("⚡ 하드웨어 트리거 활성화 (초고속 맵핑)")
         self.chk_hw_trigger.setStyleSheet("color: #E040FB; font-weight: bold;")
         self.chk_hw_trigger.setChecked(False)
@@ -2088,7 +2188,7 @@ class ControlPanelWidget(QWidget):
         self.px1 = QDoubleSpinBox();
         self.px1.setRange(0, 4096);
         self.px1.setDecimals(1);
-        self.px1.setValue(2244)
+        self.px1.setValue(2001)
         self.wl1 = QDoubleSpinBox();
         self.wl1.setRange(200, 1500);
         self.wl1.setDecimals(2);
@@ -2099,7 +2199,7 @@ class ControlPanelWidget(QWidget):
         self.px2 = QDoubleSpinBox();
         self.px2.setRange(0, 4096);
         self.px2.setDecimals(1);
-        self.px2.setValue(1649)
+        self.px2.setValue(2611)
         self.wl2 = QDoubleSpinBox();
         self.wl2.setRange(200, 1500);
         self.wl2.setDecimals(2);
@@ -2110,7 +2210,7 @@ class ControlPanelWidget(QWidget):
         self.px3 = QDoubleSpinBox();
         self.px3.setRange(0, 4096);
         self.px3.setDecimals(1);
-        self.px3.setValue(2805)
+        self.px3.setValue(1433)
         self.wl3 = QDoubleSpinBox();
         self.wl3.setRange(200, 1500);
         self.wl3.setDecimals(2);
@@ -2215,7 +2315,7 @@ class ControlPanelWidget(QWidget):
 
         self.spin_speed = QDoubleSpinBox()
         self.spin_speed.setRange(0.1, 8000);
-        self.spin_speed.setValue(1000);
+        self.spin_speed.setValue(5000);
         self.spin_speed.setSuffix(" µm/s")
         self.btn_apply_speed = QPushButton("Apply Speed")
         self.btn_apply_speed.clicked.connect(self.apply_speed)
@@ -2428,6 +2528,7 @@ class ControlPanelWidget(QWidget):
             cam.set_exposure_time(float(self.exposure_input.text()))
             cam.set_binning(int(self.binning_combo.currentText()[0]))
             cam.set_roi(int(self.roi_start.text()), int(self.roi_height.text()))
+            self.main_window.clear_dark_reference("camera settings changed")
         except:
             pass
 
@@ -2504,6 +2605,605 @@ class ControlPanelWidget(QWidget):
             self.lbl_sensor_temp.setText("현재 온도: -- ℃ (연결 안 됨)")
 
 
+class VisionTabWidget(QWidget):
+    """Embedded vision, ROI-to-mapping, and objective changer controls."""
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+
+        self.ic4_runtime = IC4Runtime()
+        self.ic4_runtime.initialize()
+        self.camera_worker = None
+        self.frame_times = []
+
+        calibration_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "vision_calibration.json",
+        )
+        self.calibration_store = CalibrationStore(calibration_path)
+        self.current_roi = None
+        self.current_mapping_ranges = None
+        self.sent_mapping_objective = None
+        self.sent_mapping_anchor_xy = None
+
+        self.csn_connected = False
+        self.csn_snapshot = None
+        self.csn_poll_failures = 0
+        self.current_objective = None
+        self.pending_objective_transition = None
+
+        self._build_ui()
+
+        self.csn_worker = CSN210Worker(parent=self)
+        self._connect_signals()
+        self._refresh_camera_devices()
+        self._objective_profile_changed(self.objective_combo.currentText())
+        self._set_csn_controls(False)
+
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        self.canvas = ImageCanvas()
+        self.canvas.setMinimumSize(480, 360)
+        splitter.addWidget(self.canvas)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(350)
+        scroll.setMaximumWidth(450)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.addWidget(self._build_vision_camera_group())
+        controls_layout.addWidget(self._build_vision_roi_group())
+        controls_layout.addWidget(self._build_objective_group())
+        controls_layout.addStretch(1)
+        scroll.setWidget(controls)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([700, 380])
+
+    def _build_vision_camera_group(self):
+        group = QGroupBox("Vision Camera - DFK 37AUX290")
+        layout = QVBoxLayout(group)
+
+        device_row = QHBoxLayout()
+        self.vision_camera_combo = QComboBox()
+        self.vision_camera_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.vision_camera_refresh = QPushButton("재검색")
+        self.vision_camera_refresh.setFixedWidth(64)
+        device_row.addWidget(self.vision_camera_combo, 1)
+        device_row.addWidget(self.vision_camera_refresh)
+        layout.addLayout(device_row)
+
+        self.vision_camera_connect = QPushButton("Vision 카메라 연결")
+        layout.addWidget(self.vision_camera_connect)
+
+        option_row = QHBoxLayout()
+        self.vision_auto_brightness = QCheckBox("Auto brightness")
+        self.vision_auto_brightness.setChecked(True)
+        self.vision_crosshair = QCheckBox("중앙 십자선")
+        self.vision_crosshair.setChecked(True)
+        option_row.addWidget(self.vision_auto_brightness)
+        option_row.addWidget(self.vision_crosshair)
+        layout.addLayout(option_row)
+
+        self.vision_camera_status = QLabel("Disconnected")
+        self.vision_frame_status = QLabel("-")
+        camera_form = QFormLayout()
+        camera_form.addRow("상태", self.vision_camera_status)
+        camera_form.addRow("프레임", self.vision_frame_status)
+        layout.addLayout(camera_form)
+        return group
+
+    def _build_vision_roi_group(self):
+        group = QGroupBox("Mapping Area")
+        layout = QVBoxLayout(group)
+
+        profile_form = QFormLayout()
+        self.objective_combo = QComboBox()
+        self.objective_combo.addItems(["20X", "100X"])
+        self.calibration_scale_label = QLabel("-")
+        profile_form.addRow("Calibration", self.objective_combo)
+        profile_form.addRow("Scale", self.calibration_scale_label)
+        layout.addLayout(profile_form)
+
+        roi_row = QHBoxLayout()
+        self.select_roi_button = QPushButton("사각형 영역 선택")
+        self.select_roi_button.setCheckable(True)
+        self.clear_vision_roi_button = QPushButton("영역 지우기")
+        roi_row.addWidget(self.select_roi_button)
+        roi_row.addWidget(self.clear_vision_roi_button)
+        layout.addLayout(roi_row)
+
+        self.roi_center_px_label = QLabel("-")
+        self.roi_center_um_label = QLabel("-")
+        self.roi_size_label = QLabel("-")
+        self.roi_x_range_label = QLabel("-")
+        self.roi_y_range_label = QLabel("-")
+        roi_form = QFormLayout()
+        roi_form.addRow("Center (px)", self.roi_center_px_label)
+        roi_form.addRow("Center (um)", self.roi_center_um_label)
+        roi_form.addRow("Size X x Y (um)", self.roi_size_label)
+        roi_form.addRow("Map X range", self.roi_x_range_label)
+        roi_form.addRow("Map Y range", self.roi_y_range_label)
+        layout.addLayout(roi_form)
+
+        coordinate_note = QLabel("영상 중심 = (0, 0), 오른쪽 = +X, 위쪽 = +Y, 아래쪽 = -Y")
+        coordinate_note.setWordWrap(True)
+        coordinate_note.setStyleSheet("color: #888888;")
+        layout.addWidget(coordinate_note)
+
+        self.send_map_area_button = QPushButton("Send Map Area")
+        self.send_map_area_button.setEnabled(False)
+        self.send_map_area_button.setStyleSheet(
+            "background-color: #1976D2; color: white; font-weight: bold;"
+        )
+        layout.addWidget(self.send_map_area_button)
+        return group
+
+    def _build_objective_group(self):
+        group = QGroupBox("CSN210 Objective Changer + Piezo Compensation")
+        layout = QVBoxLayout(group)
+
+        self.csn_connect_button = QPushButton("CSN210 연결")
+        layout.addWidget(self.csn_connect_button)
+
+        self.csn_position_label = QLabel("Disconnected")
+        self.csn_homed_label = QLabel("-")
+        self.csn_collision_label = QLabel("-")
+        self.active_objective_label = QLabel("-")
+        csn_form = QFormLayout()
+        csn_form.addRow("CSN 위치", self.csn_position_label)
+        csn_form.addRow("Homed", self.csn_homed_label)
+        csn_form.addRow("Collision", self.csn_collision_label)
+        csn_form.addRow("현재 Objective", self.active_objective_label)
+        layout.addLayout(csn_form)
+
+        button_grid = QGridLayout()
+        self.csn_home_button = QPushButton("Home")
+        self.csn_stop_button = QPushButton("STOP")
+        self.csn_position1_button = QPushButton("Position 1 (20X)")
+        self.csn_position2_button = QPushButton("Position 2 (100X)")
+        self.csn_stop_button.setStyleSheet(
+            "background-color: #a93232; color: white; font-weight: bold;"
+        )
+        button_grid.addWidget(self.csn_home_button, 0, 0)
+        button_grid.addWidget(self.csn_stop_button, 0, 1)
+        button_grid.addWidget(self.csn_position1_button, 1, 0)
+        button_grid.addWidget(self.csn_position2_button, 1, 1)
+        layout.addLayout(button_grid)
+
+        compensation = QLabel(
+            "100X -> 20X: X +68 um / Y +31 um / Z -72 um\n"
+            "20X -> 100X: X -68 um / Y -31 um / Z +72 um"
+        )
+        compensation.setWordWrap(True)
+        compensation.setStyleSheet("color: #ffb74d;")
+        layout.addWidget(compensation)
+
+        self.compensation_status_label = QLabel("Piezo compensation: waiting")
+        self.compensation_status_label.setWordWrap(True)
+        layout.addWidget(self.compensation_status_label)
+        return group
+
+    def _connect_signals(self):
+        self.vision_camera_refresh.clicked.connect(self._refresh_camera_devices)
+        self.vision_camera_connect.clicked.connect(self._toggle_vision_camera)
+        self.vision_auto_brightness.toggled.connect(self._set_auto_brightness)
+        self.vision_crosshair.toggled.connect(self.canvas.set_crosshair_visible)
+
+        self.objective_combo.currentTextChanged.connect(self._objective_profile_changed)
+        self.select_roi_button.toggled.connect(self._roi_tool_toggled)
+        self.clear_vision_roi_button.clicked.connect(self.canvas.clear_roi)
+        self.canvas.roi_changed.connect(self._vision_roi_changed)
+        self.send_map_area_button.clicked.connect(self._send_map_area)
+
+        self.csn_connect_button.clicked.connect(self._connect_csn)
+        self.csn_home_button.clicked.connect(lambda: self._send_csn_command("home"))
+        self.csn_stop_button.clicked.connect(lambda: self._send_csn_command("stop"))
+        self.csn_position1_button.clicked.connect(lambda: self._request_objective("20X"))
+        self.csn_position2_button.clicked.connect(lambda: self._request_objective("100X"))
+        self.csn_worker.connection_changed.connect(self._csn_connection_changed)
+        self.csn_worker.snapshot_ready.connect(self._csn_snapshot_ready)
+        self.csn_worker.command_started.connect(self._csn_command_started)
+        self.csn_worker.command_finished.connect(self._csn_command_finished)
+
+    # Vision camera -----------------------------------------------------
+
+    def _refresh_camera_devices(self):
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            return
+        self.vision_camera_combo.clear()
+        devices = self.ic4_runtime.enumerate_devices()
+        preferred = -1
+        for index, device in enumerate(devices):
+            self.vision_camera_combo.addItem(
+                f"{device['model']} | S/N {device['serial']}",
+                {"mode": "ic4", "serial": device["serial"]},
+            )
+            if "DFK 37AUX290" in device["model"].upper():
+                preferred = index
+        self.vision_camera_combo.addItem(
+            "Simulation",
+            {"mode": "simulation", "serial": ""},
+        )
+        if preferred >= 0:
+            self.vision_camera_combo.setCurrentIndex(preferred)
+        elif devices:
+            self.vision_camera_combo.setCurrentIndex(0)
+        else:
+            self.vision_camera_combo.setCurrentIndex(self.vision_camera_combo.count() - 1)
+            self.vision_camera_status.setText(
+                self.ic4_runtime.error or "IC4 카메라가 검색되지 않았습니다."
+            )
+
+    def _toggle_vision_camera(self):
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            self._stop_vision_camera()
+            return
+        selection = self.vision_camera_combo.currentData()
+        if not isinstance(selection, dict):
+            return
+        self.frame_times.clear()
+        worker = VisionCameraWorker(
+            selection["mode"],
+            selection["serial"],
+            auto_brightness=self.vision_auto_brightness.isChecked(),
+            parent=self,
+        )
+        worker.frame_ready.connect(self._vision_frame_ready)
+        worker.connection_changed.connect(self._vision_camera_connection_changed)
+        worker.configuration_changed.connect(self._vision_camera_configuration_changed)
+        worker.acquisition_error.connect(self._vision_camera_error)
+        worker.finished.connect(self._vision_camera_finished)
+        self.camera_worker = worker
+        self.vision_camera_combo.setEnabled(False)
+        self.vision_camera_refresh.setEnabled(False)
+        self.vision_camera_connect.setText("Vision 카메라 연결 해제")
+        self.vision_camera_status.setText("Connecting...")
+        worker.start()
+
+    def _stop_vision_camera(self):
+        worker = self.camera_worker
+        if worker is None:
+            return
+        worker.request_stop()
+        worker.wait(1800)
+
+    def _vision_camera_finished(self):
+        worker = self.sender()
+        if worker is self.camera_worker:
+            self.camera_worker = None
+        self.vision_camera_combo.setEnabled(True)
+        self.vision_camera_refresh.setEnabled(True)
+        self.vision_camera_connect.setText("Vision 카메라 연결")
+        if hasattr(worker, "deleteLater"):
+            worker.deleteLater()
+
+    def _vision_camera_connection_changed(self, connected, detail):
+        self.vision_camera_status.setText(detail)
+        if not connected and (self.camera_worker is None or not self.camera_worker.isRunning()):
+            self.vision_camera_connect.setText("Vision 카메라 연결")
+
+    def _vision_camera_configuration_changed(self, success, message):
+        if not success:
+            self.vision_auto_brightness.blockSignals(True)
+            self.vision_auto_brightness.setChecked(False)
+            self.vision_auto_brightness.blockSignals(False)
+        self.main_window.statusBar().showMessage(message, 8000)
+
+    def _vision_camera_error(self, message):
+        self.vision_camera_status.setText(f"Error: {message}")
+        self.main_window.statusBar().showMessage(f"Vision camera error: {message}", 10000)
+
+    def _set_auto_brightness(self, enabled):
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            self.camera_worker.set_auto_brightness(enabled)
+
+    def _vision_frame_ready(self, frame):
+        self.canvas.set_frame(frame)
+        now = time.monotonic()
+        self.frame_times.append(now)
+        self.frame_times = self.frame_times[-60:]
+        fps = 0.0
+        if len(self.frame_times) > 1:
+            elapsed = self.frame_times[-1] - self.frame_times[0]
+            if elapsed > 0:
+                fps = (len(self.frame_times) - 1) / elapsed
+        height, width = frame.shape[:2]
+        self.vision_frame_status.setText(f"{width} x {height} | {fps:.1f} FPS")
+        if self.current_roi is not None:
+            self._update_roi_display()
+
+    # Calibration and ROI ----------------------------------------------
+
+    def _objective_profile_changed(self, profile):
+        self.calibration_store.load()
+        scale = self.calibration_store.average_scale(profile)
+        if scale is None:
+            self.calibration_scale_label.setText(f"{profile}: calibration 없음")
+        else:
+            count = len(self.calibration_store.profiles[profile])
+            self.calibration_scale_label.setText(f"{scale:.6g} um/px (n={count})")
+        self._update_roi_display()
+
+    def _current_scale(self):
+        return self.calibration_store.average_scale(self.objective_combo.currentText())
+
+    def _roi_tool_toggled(self, checked):
+        self.canvas.set_interaction_mode("roi" if checked else "none")
+
+    def _vision_roi_changed(self, roi):
+        self.current_roi = tuple(roi) if roi is not None else None
+        self._update_roi_display()
+
+    def _update_roi_display(self):
+        self.current_mapping_ranges = None
+        if self.current_roi is None:
+            for label in (
+                self.roi_center_px_label,
+                self.roi_center_um_label,
+                self.roi_size_label,
+                self.roi_x_range_label,
+                self.roi_y_range_label,
+            ):
+                label.setText("-")
+            self.send_map_area_button.setEnabled(False)
+            return
+
+        x0, y0, x1, y1 = self.current_roi
+        self.roi_center_px_label.setText(
+            f"({(x0 + x1) / 2.0:.2f}, {(y0 + y1) / 2.0:.2f})"
+        )
+        scale = self._current_scale()
+        if scale is None:
+            self.roi_center_um_label.setText("calibration 필요")
+            self.roi_size_label.setText("calibration 필요")
+            self.roi_x_range_label.setText("-")
+            self.roi_y_range_label.setText("-")
+            self.send_map_area_button.setEnabled(False)
+            return
+
+        try:
+            ranges = roi_to_mapping_ranges(self.current_roi, self.canvas.source_size, scale)
+        except ValueError as exc:
+            self.roi_center_um_label.setText(str(exc))
+            self.send_map_area_button.setEnabled(False)
+            return
+        self.current_mapping_ranges = ranges
+        self.roi_center_um_label.setText(
+            f"({ranges['center_x_um']:.3f}, {ranges['center_y_um']:.3f})"
+        )
+        self.roi_size_label.setText(
+            f"{ranges['width_um']:.3f} x {ranges['height_um']:.3f}"
+        )
+        self.roi_x_range_label.setText(
+            f"{ranges['x_start']:.3f} to {ranges['x_end']:.3f} um"
+        )
+        self.roi_y_range_label.setText(
+            f"{ranges['y_start']:.3f} to {ranges['y_end']:.3f} um"
+        )
+        self.send_map_area_button.setEnabled(True)
+
+    def _send_map_area(self):
+        ranges = self.current_mapping_ranges
+        if ranges is None:
+            QMessageBox.warning(self, "Map Area", "유효한 ROI와 calibration이 필요합니다.")
+            return
+        anchor_x = 0.0
+        anchor_y = 0.0
+        if self.main_window.stage.is_connected:
+            anchor_x, anchor_y, _ = self.main_window.stage.read_position()
+        rounded_ranges = translate_mapping_xy_bounds(
+            ranges,
+            anchor_x,
+            anchor_y,
+            decimals=1,
+        )
+        mapping = self.main_window.mapping_view
+        mapping.combo_map_type.setCurrentIndex(0)
+        mapping.x_start.setValue(rounded_ranges["x_start"])
+        mapping.x_end.setValue(rounded_ranges["x_end"])
+        mapping.y_start.setValue(rounded_ranges["y_start"])
+        mapping.y_end.setValue(rounded_ranges["y_end"])
+        self.sent_mapping_objective = self.current_objective or self.objective_combo.currentText()
+        self.sent_mapping_anchor_xy = (anchor_x, anchor_y)
+        self.main_window.tabs.setCurrentWidget(mapping)
+        self.main_window.statusBar().showMessage(
+            "Vision ROI를 현재 stage X/Y 기준 절대 좌표로 변환하고 소수점 첫째 자리로 반올림했습니다.",
+            7000,
+        )
+
+    # Objective changer and piezo compensation ------------------------
+
+    def _connect_csn(self):
+        if self.csn_connected:
+            return
+        if csn210_vendor_app_running():
+            QMessageBox.warning(
+                self,
+                "CSN210 사용 중",
+                "CSN210_Control.exe를 종료한 뒤 다시 시도하세요.",
+            )
+            return
+        self.csn_connect_button.setEnabled(False)
+        self.csn_position_label.setText("Connecting...")
+        self.csn_worker.request("connect")
+
+    def _send_csn_command(self, command):
+        if not self.csn_connected:
+            return
+        if command == "home":
+            self.pending_objective_transition = None
+            self.current_objective = None
+            self.active_objective_label.setText("Homing / unknown")
+        self._set_csn_controls(False)
+        self.csn_worker.request(command)
+
+    def _request_objective(self, target):
+        if not self.csn_connected:
+            QMessageBox.warning(self, "Objective", "CSN210을 먼저 연결하세요.")
+            return
+        if self.current_objective is None:
+            QMessageBox.warning(self, "Objective", "현재 objective를 확인할 수 없습니다. Home 후 다시 시도하세요.")
+            return
+        if self.current_objective == target:
+            self.objective_combo.setCurrentText(target)
+            self.compensation_status_label.setText(f"{target}가 이미 선택되어 있습니다.")
+            return
+        if not self.main_window.stage.is_connected:
+            QMessageBox.warning(
+                self,
+                "Piezo stage required",
+                "Objective 전환 보정을 위해 piezo stage를 먼저 연결하세요.",
+            )
+            return
+        mapping_worker = getattr(self.main_window.mapping_view, "mapping_worker", None)
+        if mapping_worker is not None and mapping_worker.isRunning():
+            QMessageBox.warning(self, "Objective", "Mapping 실행 중에는 objective를 변경할 수 없습니다.")
+            return
+
+        delta = objective_stage_delta_um(self.current_objective, target)
+        self.pending_objective_transition = {
+            "source": self.current_objective,
+            "target": target,
+            "delta": delta,
+        }
+        self.compensation_status_label.setText(
+            f"{self.current_objective} -> {target}: CSN210 이동 대기 중"
+        )
+        self._set_csn_controls(False)
+        position = OBJECTIVE_TO_CSN_POSITION[target]
+        self.csn_worker.request("position1" if position == 1 else "position2")
+
+    def _csn_connection_changed(self, connected, info):
+        self.csn_connected = connected
+        self.csn_connect_button.setEnabled(not connected)
+        self.csn_connect_button.setText("CSN210 연결됨" if connected else "CSN210 연결")
+        if connected:
+            self.csn_position_label.setText("Connected - reading status...")
+            self._set_csn_controls(True)
+        else:
+            self.csn_position_label.setText("Disconnected")
+            self.csn_homed_label.setText("-")
+            self.csn_collision_label.setText("-")
+            self._set_csn_controls(False)
+
+    def _csn_command_started(self, command):
+        if command != "poll":
+            self.csn_position_label.setText(f"{command} command...")
+
+    def _csn_command_finished(self, command, success, message):
+        if success:
+            return
+        if command == "poll":
+            self.csn_poll_failures += 1
+            self.csn_position_label.setText(f"Read error: {message}")
+            if self.csn_poll_failures >= 3:
+                self._set_csn_controls(False)
+            return
+        if command in ("position1", "position2"):
+            self.pending_objective_transition = None
+        self.csn_connect_button.setEnabled(not self.csn_connected)
+        QMessageBox.critical(self, "CSN210 command failed", message)
+
+    def _csn_snapshot_ready(self, snapshot):
+        if not self.csn_connected:
+            return
+        self.csn_poll_failures = 0
+        self.csn_snapshot = snapshot
+        self.csn_position_label.setText(snapshot.position_text)
+        self.csn_homed_label.setText("Yes" if snapshot.homed else "No - Home required")
+        self.csn_collision_label.setText("DETECTED" if snapshot.collision else "No")
+
+        moving = snapshot.position_code in (3, 4, 5)
+        objective = CSN_POSITION_TO_OBJECTIVE.get(snapshot.position_code)
+        if objective is not None and not moving:
+            self.current_objective = objective
+            self.active_objective_label.setText(objective)
+            self.objective_combo.setCurrentText(objective)
+
+            pending = self.pending_objective_transition
+            if pending is not None and pending["target"] == objective:
+                self._apply_objective_compensation(pending)
+
+        can_move = snapshot.homed and not snapshot.collision and not moving
+        self.csn_home_button.setEnabled(not moving)
+        self.csn_position1_button.setEnabled(can_move)
+        self.csn_position2_button.setEnabled(can_move)
+        self.csn_stop_button.setEnabled(moving)
+
+    def _apply_objective_compensation(self, pending):
+        self.pending_objective_transition = None
+        dx, dy, dz = pending["delta"]
+        if not self.main_window.stage.is_connected:
+            self.compensation_status_label.setText(
+                "Objective 이동 완료, piezo가 연결 해제되어 보정하지 못했습니다."
+            )
+            QMessageBox.critical(
+                self,
+                "Piezo compensation failed",
+                "Objective는 이동했지만 piezo stage가 연결되어 있지 않아 좌표 보정을 적용하지 못했습니다.",
+            )
+            return
+        self.main_window.stage.move_relative(dx, dy, dz)
+        mapping_shifted = self._translate_sent_mapping_area(
+            pending["source"],
+            pending["target"],
+            dx,
+            dy,
+        )
+        self.compensation_status_label.setText(
+            f"{pending['source']} -> {pending['target']}: "
+            f"piezo X {dx:+.1f}, Y {dy:+.1f}, Z {dz:+.1f} um command sent"
+            + (" / Mapping X/Y shifted" if mapping_shifted else "")
+        )
+        QTimer.singleShot(250, self.main_window.control_panel._update_ui_labels)
+
+    def _translate_sent_mapping_area(self, source, target, dx, dy):
+        """Keep a Vision-sent Mapping area on the same sample after an objective change."""
+        if self.sent_mapping_objective != source:
+            return False
+        mapping = self.main_window.mapping_view
+        current_ranges = {
+            "x_start": mapping.x_start.value(),
+            "x_end": mapping.x_end.value(),
+            "y_start": mapping.y_start.value(),
+            "y_end": mapping.y_end.value(),
+        }
+        shifted = translate_mapping_xy_bounds(current_ranges, dx, dy, decimals=1)
+        mapping.x_start.setValue(shifted["x_start"])
+        mapping.x_end.setValue(shifted["x_end"])
+        mapping.y_start.setValue(shifted["y_start"])
+        mapping.y_end.setValue(shifted["y_end"])
+        self.sent_mapping_objective = target
+        if self.sent_mapping_anchor_xy is not None:
+            anchor_x, anchor_y = self.sent_mapping_anchor_xy
+            self.sent_mapping_anchor_xy = (anchor_x + dx, anchor_y + dy)
+        return True
+
+    def _set_csn_controls(self, connected):
+        self.csn_home_button.setEnabled(connected)
+        self.csn_position1_button.setEnabled(False)
+        self.csn_position2_button.setEnabled(False)
+        self.csn_stop_button.setEnabled(False)
+
+    def shutdown(self):
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            self.camera_worker.request_stop()
+            self.camera_worker.wait(2000)
+        self.csn_worker.shutdown()
+        self.ic4_runtime.close()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2513,6 +3213,10 @@ class MainWindow(QMainWindow):
         self.cam = CameraController()
         self.stage = PiezoController(port='COM4', simulate=False)
         self.is_measuring = False
+        self.dark_reference = None
+        self._dark_accumulator = None
+        self._dark_frame_count = 0
+        self._dark_target_count = 0
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -2531,8 +3235,10 @@ class MainWindow(QMainWindow):
 
         self.temp_log_view = TempLogViewWidget(self)
         self.homoepi_view = HomoepiViewWidget(self)
+        self.vision_view = VisionTabWidget(self)
 
         self.tabs.addTab(self.live_view, "📷 2D Live View")
+        self.tabs.addTab(self.vision_view, "🎥 Vision & ROI")
         self.tabs.addTab(self.spectrum_view, "📈 1D Spectrum & Temp")
         self.tabs.addTab(self.mapping_view, "🗺️ Mapping & Scan")
         self.tabs.addTab(self.homoepi_view, "💎 Homoepi (Z-Depth)")
@@ -2542,6 +3248,65 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.tabs)
         splitter.setSizes([450, 950])
         main_layout.addWidget(splitter)
+
+    def start_dark_capture(self):
+        if not self.is_measuring:
+            QMessageBox.information(
+                self,
+                "Dark capture",
+                "Block the optical input and start live monitoring before capturing dark.",
+            )
+            return
+        self.dark_reference = None
+        self._dark_accumulator = None
+        self._dark_frame_count = 0
+        self._dark_target_count = 20
+        self.control_panel.btn_capture_dark.setEnabled(False)
+        self.control_panel.lbl_dark_status.setText("Dark: capturing 0/20")
+
+    def clear_dark_reference(self, reason=None):
+        self.dark_reference = None
+        self._dark_accumulator = None
+        self._dark_frame_count = 0
+        self._dark_target_count = 0
+        if hasattr(self, 'control_panel'):
+            self.control_panel.btn_capture_dark.setEnabled(True)
+            suffix = f" ({reason})" if reason else ""
+            self.control_panel.lbl_dark_status.setText(f"Dark: none{suffix}")
+
+    def subtract_dark(self, frame):
+        array = np.asarray(frame)
+        reference = self.dark_reference
+        if reference is None:
+            return array
+        if reference.shape != array.shape:
+            self.clear_dark_reference("frame shape changed")
+            return array
+        return array.astype(np.float32) - reference
+
+    def process_live_frame(self, frame):
+        array = np.asarray(frame)
+        if self._dark_target_count > 0:
+            sample = array.astype(np.float64)
+            if self._dark_accumulator is None:
+                self._dark_accumulator = sample.copy()
+            else:
+                self._dark_accumulator += sample
+            self._dark_frame_count += 1
+            self.control_panel.lbl_dark_status.setText(
+                f"Dark: capturing {self._dark_frame_count}/{self._dark_target_count}"
+            )
+            if self._dark_frame_count >= self._dark_target_count:
+                self.dark_reference = (
+                    self._dark_accumulator / float(self._dark_frame_count)
+                ).astype(np.float32)
+                self._dark_target_count = 0
+                self._dark_accumulator = None
+                self.spectrum_view.rolling_buffer.clear()
+                self.control_panel.btn_capture_dark.setEnabled(True)
+                self.control_panel.lbl_dark_status.setText("Dark: 20-frame average active")
+                self.statusBar().showMessage("20-frame dark reference captured", 5000)
+        return self.subtract_dark(array)
 
     def toggle_camera(self):
         if not self.cam.is_connected:
@@ -2555,6 +3320,7 @@ class MainWindow(QMainWindow):
         else:
             if self.is_measuring: self.toggle_measurement()
             self.cam.disconnect()
+            self.clear_dark_reference("camera disconnected")
             self.control_panel.btn_cam_connect.setText("카메라 연결")
 
     def toggle_stage(self):
@@ -2589,6 +3355,8 @@ class MainWindow(QMainWindow):
             self.is_measuring = True
         else:
             self.live_view.stop_live()
+            if self._dark_target_count > 0:
+                self.clear_dark_reference("capture interrupted")
             self.control_panel.btn_start_meas.setText("▶ 라이브 뷰/스펙트럼 모니터링 시작")
             self.control_panel.btn_start_meas.setStyleSheet(
                 "background-color: #4CAF50; color: white; font-weight: bold;")
@@ -2596,6 +3364,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.live_view.stop_live()
+        self.vision_view.shutdown()
         if hasattr(self.mapping_view, 'mapping_worker') and self.mapping_view.mapping_worker.isRunning():
             self.mapping_view.stop_simulation()
 
